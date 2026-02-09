@@ -7,6 +7,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/rankjie/homeassistant_petkit/issues",
   "loggers": ["petkit"],
-  "requirements": ["rankjie-pypetkitapi==1.22.5.dev1", "aiofiles==24.1.0", "paho-mqtt==1.6.1"],
-  "version": "1.22.6.dev1"
+  "requirements": ["rankjie-pypetkitapi==1.3.0.dev1", "aiofiles==24.1.0", "paho-mqtt==1.6.1"],
+  "version": "1.3.0.dev1"
 }

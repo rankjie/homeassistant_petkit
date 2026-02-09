@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from aiohttp import web
 from pypetkitapi import PetKitClient
 
 import voluptuous as vol
 
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_REGION,
@@ -62,11 +64,58 @@ PLATFORMS: list[Platform] = [
 ]
 
 
+class PetkitSessionView(HomeAssistantView):
+    """Expose PetKit session tokens for external consumers (e.g. Scrypted)."""
+
+    url = "/api/petkit/session"
+    name = "api:petkit:session"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return session info for one or all PetKit accounts."""
+        hass = request.app["hass"]
+        username_filter = request.query.get("username")
+
+        sessions = []
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            runtime = getattr(entry, "runtime_data", None)
+            if not runtime or not runtime.client:
+                continue
+            client: PetKitClient = runtime.client
+            account_username = entry.data.get(CONF_USERNAME, "")
+
+            if username_filter and account_username != username_filter:
+                continue
+
+            await client.validate_session()
+            if client._session:
+                sessions.append({
+                    "username": account_username,
+                    "session_id": client._session.id,
+                    "base_url": client.req.base_url,
+                })
+
+        if username_filter:
+            if not sessions:
+                return self.json_message(
+                    f"No active session for {username_filter}", 404
+                )
+            return self.json(sessions[0])
+
+        if not sessions:
+            return self.json_message("No active PetKit sessions", 404)
+
+        return self.json(sessions)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: PetkitConfigEntry,
 ) -> bool:
     """Set up this integration using UI."""
+
+    # Register session view once (idempotent — HA deduplicates by name)
+    hass.http.register_view(PetkitSessionView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone

@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+import hashlib
+import hmac
 import json
 import re
 from typing import Any
@@ -92,6 +94,26 @@ class ParsedIoTMessage:
     message_type: str | None = None
     payload: MqttPayload | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+def _aliyun_mqtt_sign(
+    product_key: str, device_name: str, device_secret: str, client_id: str,
+) -> tuple[str, str, str]:
+    """Compute Aliyun IoT MQTT credentials (clientId, username, password).
+
+    Follows the Alibaba Cloud IoT authentication protocol:
+    - clientId: ``{clientId}|securemode=3,signmethod=hmacsha256|``
+    - username: ``{deviceName}&{productKey}``
+    - password: HMAC-SHA256(deviceSecret, content) where content is
+      ``clientId{cid}deviceName{dn}productKey{pk}`` (keys sorted alphabetically).
+    """
+    content = f"clientId{client_id}deviceName{device_name}productKey{product_key}"
+    sign = hmac.new(
+        device_secret.encode(), content.encode(), hashlib.sha256
+    ).hexdigest()
+    mqtt_client_id = f"{client_id}|securemode=3,signmethod=hmacsha256|"
+    mqtt_username = f"{device_name}&{product_key}"
+    return mqtt_client_id, mqtt_username, sign
 
 
 def _parse_mqtt_host(raw: str, *, default_port: int = 1883) -> _MqttEndpoint:
@@ -255,15 +277,20 @@ class PetkitIotMqttListener:
         # /user/update is the will/publish topic — subscribing to it may trigger ACL denials.
         self._subscribe_topics = [f"{base}/get"]
 
-        # MQTT 3.1.1 with persistent session (mirrors the Android app).
-        client_id = iot.device_name
+        # Aliyun IoT MQTT requires HMAC-signed credentials.
+        mqtt_client_id, mqtt_username, mqtt_password = _aliyun_mqtt_sign(
+            product_key=iot.product_key,
+            device_name=iot.device_name,
+            device_secret=iot.device_secret,
+            client_id=iot.device_name,
+        )
         paho_client = mqtt.Client(
             CallbackAPIVersion.VERSION1,
-            client_id=client_id,
+            client_id=mqtt_client_id,
             clean_session=False,
             protocol=mqtt.MQTTv311,
         )
-        paho_client.username_pw_set(iot.device_name, iot.device_secret)
+        paho_client.username_pw_set(mqtt_username, mqtt_password)
         paho_client.will_set(
             f"{base}/update", payload='{"status":"offline"}', qos=0, retain=False
         )

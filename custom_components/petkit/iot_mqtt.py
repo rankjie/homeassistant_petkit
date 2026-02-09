@@ -24,8 +24,10 @@ from .coordinator import PetkitDataUpdateCoordinator
 
 try:  # pragma: no cover
     import paho.mqtt.client as mqtt
+    from paho.mqtt.enums import CallbackAPIVersion
 except ImportError:  # pragma: no cover
     mqtt = None  # type: ignore[assignment]
+    CallbackAPIVersion = None  # type: ignore[assignment,misc]
 
 
 _HOST_PORT_RE = re.compile(r"^(?P<host>.+?)(?::(?P<port>\d+))?$")
@@ -117,7 +119,12 @@ class PetkitIotMqttListener:
 
         # MQTT 3.1.1 with persistent session (mirrors the Android app).
         client_id = iot.device_name
-        paho_client = mqtt.Client(client_id=client_id, clean_session=False, protocol=mqtt.MQTTv311)
+        paho_client = mqtt.Client(
+            CallbackAPIVersion.VERSION1,
+            client_id=client_id,
+            clean_session=False,
+            protocol=mqtt.MQTTv311,
+        )
         paho_client.username_pw_set(iot.device_name, iot.device_secret)
         paho_client.reconnect_delay_set(min_delay=1, max_delay=30)
 

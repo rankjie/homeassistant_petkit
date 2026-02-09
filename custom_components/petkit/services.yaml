@@ -1,0 +1,29 @@
+mqtt_dump:
+  name: Dump MQTT Messages
+  description: >
+    Dump recently received Petkit IoT MQTT messages to the Home Assistant log and fire a
+    petkit_mqtt_dump event containing the dumped messages.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional Petkit config entry id to target.
+      required: false
+      selector:
+        text: {}
+    limit:
+      name: Limit
+      description: Number of most recent messages to dump (per entry).
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 200
+          mode: box
+    topic_contains:
+      name: Topic Contains
+      description: Only include messages whose topic contains this substring.
+      required: false
+      selector:
+        text: {}
+

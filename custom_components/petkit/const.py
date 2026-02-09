@@ -8,9 +8,17 @@ COORDINATOR = "coordinator"
 COORDINATOR_MEDIA = "coordinator_media"
 COORDINATOR_BLUETOOTH = "coordinator_bluetooth"
 
+# Services
+SERVICE_MQTT_DUMP = "mqtt_dump"
+
+# Events
+EVENT_MQTT_MESSAGE = "petkit_mqtt_message"
+EVENT_MQTT_DUMP = "petkit_mqtt_dump"
+
 # Configuration
 CONF_SCAN_INTERVAL_MEDIA = "scan_interval_media"
 CONF_SMART_POLLING = "smart_polling"
+CONF_REALTIME_MQTT = "realtime_mqtt"
 
 BT_SECTION = "bluetooth_options"
 CONF_BLE_RELAY_ENABLED = "ble_relay_enabled"
@@ -39,6 +47,7 @@ DEFAULT_EVENTS = [
 DEFAULT_DL_VIDEO = False
 DEFAULT_DL_IMAGE = True
 DEFAULT_SMART_POLLING = True
+DEFAULT_REALTIME_MQTT = False
 DEFAULT_BLUETOOTH_RELAY = True
 DEFAULT_DELETE_AFTER = 3
 DEFAULT_MEDIA_PATH = "/media"

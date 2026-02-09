@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 from pypetkitapi import PetKitClient
 
+import voluptuous as vol
+
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_REGION,
@@ -23,12 +25,16 @@ from .const import (
     BT_SECTION,
     CONF_SCAN_INTERVAL_BLUETOOTH,
     CONF_SCAN_INTERVAL_MEDIA,
+    CONF_REALTIME_MQTT,
     COORDINATOR,
     COORDINATOR_BLUETOOTH,
     COORDINATOR_MEDIA,
+    DEFAULT_REALTIME_MQTT,
     DOMAIN,
+    EVENT_MQTT_DUMP,
     LOGGER,
     MEDIA_SECTION,
+    SERVICE_MQTT_DUMP,
 )
 from .coordinator import (
     PetkitBluetoothUpdateCoordinator,
@@ -110,6 +116,73 @@ async def async_setup_entry(
     await coordinator_media.async_config_entry_first_refresh()
     await coordinator_bluetooth.async_config_entry_first_refresh()
 
+    if entry.options.get(CONF_REALTIME_MQTT, DEFAULT_REALTIME_MQTT):
+        from .iot_mqtt import PetkitIotMqttListener
+
+        mqtt_listener = PetkitIotMqttListener(
+            hass=hass,
+            client=entry.runtime_data.client,
+            coordinator=coordinator,
+        )
+        entry.runtime_data.mqtt_listener = mqtt_listener
+        await mqtt_listener.async_start()
+
+    if not hass.services.has_service(DOMAIN, SERVICE_MQTT_DUMP):
+        schema = vol.Schema(
+            {
+                vol.Optional("entry_id"): str,
+                vol.Optional("limit", default=1): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=200)
+                ),
+                vol.Optional("topic_contains"): str,
+            }
+        )
+
+        async def _async_mqtt_dump(call) -> None:  # noqa: ANN001
+            target_entry_id = call.data.get("entry_id")
+            limit = call.data["limit"]
+            topic_contains = call.data.get("topic_contains")
+
+            messages: list[dict] = []
+            for ent in hass.config_entries.async_entries(DOMAIN):
+                if target_entry_id and ent.entry_id != target_entry_id:
+                    continue
+                runtime = getattr(ent, "runtime_data", None)
+                listener = getattr(runtime, "mqtt_listener", None)
+                if listener is None:
+                    continue
+
+                for msg in listener.get_recent_messages(
+                    limit=limit, topic_contains=topic_contains
+                ):
+                    enriched = dict(msg)
+                    enriched["entry_id"] = ent.entry_id
+                    enriched["account"] = ent.title
+                    messages.append(enriched)
+
+            if not messages:
+                LOGGER.info("Petkit MQTT dump: no messages available")
+            else:
+                LOGGER.info("Petkit MQTT dump: dumping %s message(s)", len(messages))
+                for msg in messages:
+                    LOGGER.info(
+                        "Petkit MQTT dump entry=%s topic=%s payload_encoding=%s received_at=%s payload=%s",
+                        msg.get("entry_id"),
+                        msg.get("topic"),
+                        msg.get("payload_encoding"),
+                        msg.get("received_at"),
+                        msg.get("payload"),
+                    )
+
+            hass.bus.async_fire(EVENT_MQTT_DUMP, {"messages": messages})
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_MQTT_DUMP,
+            _async_mqtt_dump,
+            schema=schema,
+        )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
@@ -128,6 +201,10 @@ async def async_unload_entry(
     entry: PetkitConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
+    mqtt_listener = getattr(entry.runtime_data, "mqtt_listener", None)
+    if mqtt_listener is not None:
+        await mqtt_listener.async_stop()
+
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

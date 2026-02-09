@@ -193,13 +193,33 @@ async def async_setup_entry(
             topic_contains = call.data.get("topic_contains")
 
             messages: list[dict] = []
+            found_listener = False
             for ent in hass.config_entries.async_entries(DOMAIN):
                 if target_entry_id and ent.entry_id != target_entry_id:
                     continue
                 runtime = getattr(ent, "runtime_data", None)
+                mqtt_enabled = ent.options.get(CONF_REALTIME_MQTT, DEFAULT_REALTIME_MQTT)
                 listener = getattr(runtime, "mqtt_listener", None)
+
+                if mqtt_enabled and listener is None:
+                    LOGGER.warning(
+                        "Petkit MQTT dump: MQTT is enabled for %s but no listener is running",
+                        ent.title,
+                    )
+                    continue
+
                 if listener is None:
                     continue
+
+                found_listener = True
+                diag = listener.diagnostics
+                LOGGER.info(
+                    "Petkit MQTT dump: account=%s status=%s messages_received=%s buffer_size=%s",
+                    ent.title,
+                    diag["status"],
+                    diag["messages_received"],
+                    diag["buffer_size"],
+                )
 
                 for msg in listener.get_recent_messages(
                     limit=limit, topic_contains=topic_contains
@@ -209,7 +229,9 @@ async def async_setup_entry(
                     enriched["account"] = ent.title
                     messages.append(enriched)
 
-            if not messages:
+            if not found_listener:
+                LOGGER.info("Petkit MQTT dump: no MQTT listeners active")
+            elif not messages:
                 LOGGER.info("Petkit MQTT dump: no messages available")
             else:
                 LOGGER.info("Petkit MQTT dump: dumping %s message(s)", len(messages))

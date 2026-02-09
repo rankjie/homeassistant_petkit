@@ -11,8 +11,12 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+import json
 import re
+from typing import Any
 
 from pypetkitapi.client import PetKitClient
 
@@ -31,6 +35,17 @@ except ImportError:  # pragma: no cover
 
 
 _HOST_PORT_RE = re.compile(r"^(?P<host>.+?)(?::(?P<port>\d+))?$")
+_SCHEME_RE = re.compile(r"^(?:tcp|ssl|mqtt|mqtts)://", re.IGNORECASE)
+
+
+class MqttConnectionStatus(StrEnum):
+    """MQTT connection status."""
+
+    NOT_STARTED = "not_started"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -39,11 +54,54 @@ class _MqttEndpoint:
     port: int
 
 
+# ---------------------------------------------------------------------------
+# Message parsing dataclasses (mirrors Android app's IoTMessage structure)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MqttInnerContent:
+    """Parsed inner `contentAsString` JSON."""
+
+    inner_type: int | None = None
+    snapshot: dict[str, Any] | None = None
+    content: Any = None
+    payload: Any = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MqttPayload:
+    """Parsed `NewMessage` payload."""
+
+    content_as_string: str | None = None
+    from_field: str | None = None
+    to: str | None = None
+    time: int | None = None
+    timestamp: int | None = None
+    inner: MqttInnerContent | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ParsedIoTMessage:
+    """Top-level parsed IoT message."""
+
+    device_name: str | None = None
+    timestamp: int | None = None
+    message_type: str | None = None
+    payload: MqttPayload | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 def _parse_mqtt_host(raw: str, *, default_port: int = 1883) -> _MqttEndpoint:
     """Parse `host[:port]` as returned by Petkit's IoT endpoint."""
     raw = (raw or "").strip()
     if not raw:
         raise ValueError("Empty mqtt host")
+
+    # Strip URI scheme prefixes (tcp://, ssl://, mqtt://, mqtts://)
+    raw = _SCHEME_RE.sub("", raw)
 
     # Very small parser; Petkit appears to return host:port for IPv4/hostname.
     # If we ever encounter IPv6 literals, we can extend this to handle [::1]:1883.
@@ -58,6 +116,58 @@ def _parse_mqtt_host(raw: str, *, default_port: int = 1883) -> _MqttEndpoint:
     if not host:
         raise ValueError(f"Invalid mqtt host: {raw!r}")
     return _MqttEndpoint(host=host, port=port)
+
+
+def _parse_inner_content(text: str | None) -> MqttInnerContent | None:
+    """Parse the inner `contentAsString` JSON payload."""
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return MqttInnerContent(
+        inner_type=data.get("type"),
+        snapshot=data.get("snapshot") if isinstance(data.get("snapshot"), dict) else None,
+        content=data.get("content"),
+        payload=data.get("payload"),
+        raw=data,
+    )
+
+
+def _parse_iot_message(payload_text: str) -> ParsedIoTMessage | None:
+    """Parse a full IoT MQTT message from its JSON text."""
+    try:
+        data = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    # Parse the nested NewMessage payload
+    raw_payload = data.get("payload")
+    mqtt_payload: MqttPayload | None = None
+    if isinstance(raw_payload, dict):
+        content_str = raw_payload.get("contentAsString")
+        mqtt_payload = MqttPayload(
+            content_as_string=content_str,
+            from_field=raw_payload.get("from"),
+            to=raw_payload.get("to"),
+            time=raw_payload.get("time"),
+            timestamp=raw_payload.get("timestamp"),
+            inner=_parse_inner_content(content_str),
+            raw=raw_payload,
+        )
+
+    return ParsedIoTMessage(
+        device_name=data.get("deviceName"),
+        timestamp=data.get("timestamp"),
+        message_type=data.get("type"),
+        payload=mqtt_payload,
+        raw=data,
+    )
 
 
 class PetkitIotMqttListener:
@@ -84,6 +194,30 @@ class PetkitIotMqttListener:
         self._petkit_product_key: str | None = None
         self._recent_messages: deque[dict] = deque(maxlen=200)
 
+        # Connection status tracking
+        self._connection_status = MqttConnectionStatus.NOT_STARTED
+        self._messages_received: int = 0
+        self._last_message_at: datetime | None = None
+        self._first_message_logged = False
+
+    @property
+    def connection_status(self) -> MqttConnectionStatus:
+        """Return current MQTT connection status."""
+        return self._connection_status
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        """Return diagnostic info about the MQTT connection."""
+        return {
+            "status": self._connection_status.value,
+            "messages_received": self._messages_received,
+            "last_message_at": (
+                self._last_message_at.isoformat() if self._last_message_at else None
+            ),
+            "buffer_size": len(self._recent_messages),
+            "topics": list(self._subscribe_topics),
+        }
+
     async def async_start(self) -> None:
         """Start the MQTT connection in the background."""
         if self._started:
@@ -92,30 +226,34 @@ class PetkitIotMqttListener:
 
         if mqtt is None:  # pragma: no cover
             LOGGER.error("paho-mqtt not installed; Petkit MQTT listener cannot start")
+            self._connection_status = MqttConnectionStatus.FAILED
             return
 
         try:
             iot = await self.client.get_iot_mqtt_config()
         except Exception as err:  # noqa: BLE001
             LOGGER.warning("Failed to fetch Petkit IoT MQTT config: %s", err)
+            self._connection_status = MqttConnectionStatus.FAILED
             return
 
         if not (iot.mqtt_host and iot.device_name and iot.device_secret and iot.product_key):
             LOGGER.warning("Petkit IoT MQTT config is missing required fields; listener disabled")
+            self._connection_status = MqttConnectionStatus.FAILED
             return
 
         try:
             endpoint = _parse_mqtt_host(iot.mqtt_host)
         except ValueError as err:
             LOGGER.warning("Invalid Petkit MQTT host %r: %s", iot.mqtt_host, err)
+            self._connection_status = MqttConnectionStatus.FAILED
             return
 
         self._petkit_device_name = iot.device_name
         self._petkit_product_key = iot.product_key
         base = f"/{iot.product_key}/{iot.device_name}/user"
-        # The official Android app subscribes to /user/get and uses /user/update as its will topic.
-        # Subscribing to both gives us a better chance to observe relevant traffic if ACLs allow it.
-        self._subscribe_topics = [f"{base}/get", f"{base}/update"]
+        # The official Android app only subscribes to /user/get.
+        # /user/update is the will/publish topic — subscribing to it may trigger ACL denials.
+        self._subscribe_topics = [f"{base}/get"]
 
         # MQTT 3.1.1 with persistent session (mirrors the Android app).
         client_id = iot.device_name
@@ -126,6 +264,9 @@ class PetkitIotMqttListener:
             protocol=mqtt.MQTTv311,
         )
         paho_client.username_pw_set(iot.device_name, iot.device_secret)
+        paho_client.will_set(
+            f"{base}/update", payload='{"status":"offline"}', qos=0, retain=False
+        )
         paho_client.reconnect_delay_set(min_delay=1, max_delay=30)
 
         paho_client.on_connect = self._on_connect
@@ -133,6 +274,7 @@ class PetkitIotMqttListener:
         paho_client.on_message = self._on_message
 
         self._mqtt_client = paho_client
+        self._connection_status = MqttConnectionStatus.CONNECTING
 
         try:
             paho_client.connect_async(endpoint.host, endpoint.port, keepalive=60)
@@ -140,7 +282,8 @@ class PetkitIotMqttListener:
         except Exception as err:  # noqa: BLE001
             LOGGER.warning("Failed to start Petkit MQTT connection: %s", err)
             self._mqtt_client = None
-            self._subscribe_topic = None
+            self._subscribe_topics = []
+            self._connection_status = MqttConnectionStatus.FAILED
             return
 
         LOGGER.info(
@@ -177,27 +320,35 @@ class PetkitIotMqttListener:
         except Exception:  # noqa: BLE001
             LOGGER.debug("Petkit MQTT loop_stop raised", exc_info=True)
 
+        self._connection_status = MqttConnectionStatus.DISCONNECTED
         LOGGER.info("Petkit MQTT listener stopped")
 
     def _on_connect(self, client, userdata, flags, rc, *args, **kwargs) -> None:  # noqa: ANN001
         topics = self._subscribe_topics
         if rc != 0:
             LOGGER.warning("Petkit MQTT connect failed (rc=%s)", rc)
+            self._connection_status = MqttConnectionStatus.FAILED
             return
+        self._connection_status = MqttConnectionStatus.CONNECTED
         if not topics:
             LOGGER.warning("Petkit MQTT connected but subscribe topics are missing")
             return
         try:
             for topic in topics:
                 client.subscribe(topic, qos=0)
-            LOGGER.debug("Petkit MQTT subscribed to %s", topics)
+            LOGGER.info("Petkit MQTT subscribed to %s", topics)
         except Exception:  # noqa: BLE001
-            LOGGER.debug("Petkit MQTT subscribe failed", exc_info=True)
+            LOGGER.warning("Petkit MQTT subscribe failed", exc_info=True)
 
     def _on_disconnect(self, client, userdata, rc, *args, **kwargs) -> None:  # noqa: ANN001
         # paho-mqtt will try to reconnect (reconnect_on_failure / reconnect_delay_set),
         # so we just log.
-        LOGGER.debug("Petkit MQTT disconnected (rc=%s)", rc)
+        if rc != 0:
+            LOGGER.warning("Petkit MQTT disconnected unexpectedly (rc=%s)", rc)
+            self._connection_status = MqttConnectionStatus.DISCONNECTED
+        else:
+            LOGGER.info("Petkit MQTT disconnected cleanly")
+            self._connection_status = MqttConnectionStatus.DISCONNECTED
 
     def _on_message(self, client, userdata, msg) -> None:  # noqa: ANN001
         # Called from the paho-mqtt network thread. Always hop back onto HA's loop.
@@ -207,6 +358,17 @@ class PetkitIotMqttListener:
 
     def _handle_message(self, topic: str | None, payload: bytes) -> None:
         """Handle an incoming MQTT message on the HA event loop thread."""
+        self._messages_received += 1
+        self._last_message_at = dt_util.utcnow()
+
+        if not self._first_message_logged:
+            self._first_message_logged = True
+            LOGGER.info(
+                "Petkit MQTT: first message received (topic=%s, %d bytes)",
+                topic,
+                len(payload),
+            )
+
         payload_encoding = "utf-8"
         try:
             payload_text = payload.decode("utf-8")
@@ -214,19 +376,42 @@ class PetkitIotMqttListener:
             payload_text = base64.b64encode(payload).decode("ascii")
             payload_encoding = "base64"
 
-        event_data = {
+        event_data: dict[str, Any] = {
             "topic": topic or "",
             "payload": payload_text,
             "payload_encoding": payload_encoding,
-            "received_at": dt_util.utcnow().isoformat(),
+            "received_at": self._last_message_at.isoformat(),
             "petkit_device_name": self._petkit_device_name or "",
             "petkit_product_key": self._petkit_product_key or "",
         }
+
+        # Parse structured message data
+        if payload_encoding == "utf-8":
+            parsed = _parse_iot_message(payload_text)
+            if parsed is not None:
+                event_data["message_type"] = parsed.message_type
+                event_data["source_device"] = parsed.device_name
+                if parsed.payload and parsed.payload.inner:
+                    event_data["inner_type"] = parsed.payload.inner.inner_type
+                self._dispatch_parsed_message(parsed)
 
         self._recent_messages.append(event_data)
         self.hass.bus.async_fire("petkit_mqtt_message", event_data)
 
         self._schedule_refresh()
+
+    def _dispatch_parsed_message(self, parsed: ParsedIoTMessage) -> None:
+        """Dispatch a parsed MQTT message. Future: map types to coordinator updates."""
+        inner_type = None
+        if parsed.payload and parsed.payload.inner:
+            inner_type = parsed.payload.inner.inner_type
+
+        LOGGER.debug(
+            "Petkit MQTT parsed: type=%s device=%s inner_type=%s",
+            parsed.message_type,
+            parsed.device_name,
+            inner_type,
+        )
 
     def get_recent_messages(
         self, *, limit: int = 1, topic_contains: str | None = None
@@ -252,4 +437,4 @@ class PetkitIotMqttListener:
             self.coordinator.enable_smart_polling(12)
             await self.coordinator.async_request_refresh()
         except Exception:  # noqa: BLE001
-            LOGGER.debug("MQTT-triggered refresh failed", exc_info=True)
+            LOGGER.warning("MQTT-triggered refresh failed", exc_info=True)

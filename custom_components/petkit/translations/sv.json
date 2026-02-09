@@ -140,6 +140,12 @@
       "start_maintenance": {
         "name": "Underhåll: Starta"
       },
+      "camera_rotate_outward": {
+        "name": "Camera rotate outward"
+      },
+      "camera_rotate_inward": {
+        "name": "Camera rotate inward"
+      },
       "start_scoop": {
         "name": "Skopa"
       }

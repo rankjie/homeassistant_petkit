@@ -182,6 +182,12 @@
       "level_litter": {
         "name": "抚平"
       },
+      "camera_rotate_outward": {
+        "name": "摄像头向外旋转"
+      },
+      "camera_rotate_inward": {
+        "name": "摄像头向内旋转"
+      },
       "reset_filter": {
         "name": "复位滤芯"
       }

@@ -182,12 +182,6 @@
       "level_litter": {
         "name": "Level litter"
       },
-      "camera_rotate_outward": {
-        "name": "Camera rotate outward"
-      },
-      "camera_rotate_inward": {
-        "name": "Camera rotate inward"
-      },
       "reset_filter": {
         "name": "Reset filter"
       }

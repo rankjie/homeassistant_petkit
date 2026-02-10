@@ -753,7 +753,7 @@ SWITCH_MAPPING: dict[type[PetkitDevices], list[PetKitSwitchDesc]] = {
                 device.id, DeviceCommand.UPDATE_SETTING, {"homeMode": 1}
             ),
             turn_off=lambda api, device: api.send_api_request(
-                device.id, DeviceCommand.UPDATE_SETTING, {"homeMode": 0, "cameraInward": 0}
+                device.id, DeviceCommand.UPDATE_SETTING, {"homeMode": 0}
             ),
         ),
         PetKitSwitchDesc(

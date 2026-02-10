@@ -129,12 +129,6 @@
       "start_maintenance": {
         "name": "Maintenance : D\u00e9marrer"
       },
-      "camera_rotate_outward": {
-        "name": "Camera rotate outward"
-      },
-      "camera_rotate_inward": {
-        "name": "Camera rotate inward"
-      },
       "start_scoop": {
         "name": "Nettoyer"
       }

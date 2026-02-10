@@ -238,22 +238,6 @@ BUTTON_MAPPING: dict[type[PetkitDevices], list[PetKitButtonDesc]] = {
             ),
             is_available=lambda device: device.state.work_state is None,
         ),
-        PetKitButtonDesc(
-            key="Camera rotate outward",
-            translation_key="camera_rotate_outward",
-            action=lambda api, device: api.send_api_request(
-                device.id, DeviceCommand.UPDATE_SETTING, {"cameraInward": 0}
-            ),
-            only_for_types=LITTER_WITH_CAMERA,
-        ),
-        PetKitButtonDesc(
-            key="Camera rotate inward",
-            translation_key="camera_rotate_inward",
-            action=lambda api, device: api.send_api_request(
-                device.id, DeviceCommand.UPDATE_SETTING, {"cameraInward": 1}
-            ),
-            only_for_types=LITTER_WITH_CAMERA,
-        ),
     ],
     WaterFountain: [
         *COMMON_ENTITIES,

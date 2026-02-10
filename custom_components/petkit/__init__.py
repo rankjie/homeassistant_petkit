@@ -108,14 +108,67 @@ class PetkitSessionView(HomeAssistantView):
         return self.json(sessions)
 
 
+class PetkitIotView(HomeAssistantView):
+    """Expose PetKit IoT/MQTT credentials for external consumers."""
+
+    url = "/api/petkit/iot"
+    name = "api:petkit:iot"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return IoT MQTT config for one or all PetKit accounts."""
+        hass = request.app["hass"]
+        username_filter = request.query.get("username")
+
+        results = []
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            runtime = getattr(entry, "runtime_data", None)
+            if not runtime or not runtime.client:
+                continue
+            client: PetKitClient = runtime.client
+            account_username = entry.data.get(CONF_USERNAME, "")
+
+            if username_filter and account_username != username_filter:
+                continue
+
+            try:
+                iot = await client.get_iot_mqtt_config()
+                results.append({
+                    "username": account_username,
+                    "deviceName": iot.device_name,
+                    "deviceSecret": iot.device_secret,
+                    "productKey": iot.product_key,
+                    "mqttHost": iot.mqtt_host,
+                    "iotInstanceId": iot.iot_instance_id,
+                })
+            except Exception as err:  # noqa: BLE001
+                results.append({
+                    "username": account_username,
+                    "error": str(err),
+                })
+
+        if username_filter:
+            if not results:
+                return self.json_message(
+                    f"No IoT config for {username_filter}", 404
+                )
+            return self.json(results[0])
+
+        if not results:
+            return self.json_message("No PetKit accounts found", 404)
+
+        return self.json(results)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: PetkitConfigEntry,
 ) -> bool:
     """Set up this integration using UI."""
 
-    # Register session view once (idempotent — HA deduplicates by name)
+    # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitSessionView())
+    hass.http.register_view(PetkitIotView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone

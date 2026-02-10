@@ -65,7 +65,7 @@ class _MqttEndpoint:
 class MqttInnerContent:
     """Parsed inner `contentAsString` JSON."""
 
-    inner_type: int | None = None
+    inner_type: int | str | None = None
     snapshot: dict[str, Any] | None = None
     content: Any = None
     payload: Any = None
@@ -173,10 +173,15 @@ def _parse_iot_message(payload_text: str) -> ParsedIoTMessage | None:
     mqtt_payload: MqttPayload | None = None
     if isinstance(raw_payload, dict):
         content_str = raw_payload.get("contentAsString")
+        # "from" and "to" can be either strings or {"username": "..."}
+        raw_from = raw_payload.get("from")
+        raw_to = raw_payload.get("to")
+        from_str = raw_from.get("username") if isinstance(raw_from, dict) else raw_from
+        to_str = raw_to.get("username") if isinstance(raw_to, dict) else raw_to
         mqtt_payload = MqttPayload(
             content_as_string=content_str,
-            from_field=raw_payload.get("from"),
-            to=raw_payload.get("to"),
+            from_field=from_str,
+            to=to_str,
             time=raw_payload.get("time"),
             timestamp=raw_payload.get("timestamp"),
             inner=_parse_inner_content(content_str),
@@ -388,20 +393,37 @@ class PetkitIotMqttListener:
         self._messages_received += 1
         self._last_message_at = dt_util.utcnow()
 
-        if not self._first_message_logged:
-            self._first_message_logged = True
-            LOGGER.info(
-                "Petkit MQTT: first message received (topic=%s, %d bytes)",
-                topic,
-                len(payload),
-            )
-
         payload_encoding = "utf-8"
         try:
             payload_text = payload.decode("utf-8")
         except UnicodeDecodeError:
             payload_text = base64.b64encode(payload).decode("ascii")
             payload_encoding = "base64"
+
+        # Parse structured message data
+        inner_type_str = None
+        parsed: ParsedIoTMessage | None = None
+        if payload_encoding == "utf-8":
+            parsed = _parse_iot_message(payload_text)
+
+        # Log every message at INFO with useful detail
+        if parsed and parsed.payload and parsed.payload.inner:
+            inner_type_str = parsed.payload.inner.inner_type
+            LOGGER.info(
+                "Petkit MQTT #%d: topic=%s type=%s inner=%s from=%s",
+                self._messages_received,
+                topic,
+                parsed.message_type,
+                inner_type_str,
+                parsed.payload.from_field,
+            )
+        else:
+            LOGGER.info(
+                "Petkit MQTT #%d: topic=%s (%d bytes)",
+                self._messages_received,
+                topic,
+                len(payload),
+            )
 
         event_data: dict[str, Any] = {
             "topic": topic or "",
@@ -412,33 +434,16 @@ class PetkitIotMqttListener:
             "petkit_product_key": self._petkit_product_key or "",
         }
 
-        # Parse structured message data
-        if payload_encoding == "utf-8":
-            parsed = _parse_iot_message(payload_text)
-            if parsed is not None:
-                event_data["message_type"] = parsed.message_type
-                event_data["source_device"] = parsed.device_name
-                if parsed.payload and parsed.payload.inner:
-                    event_data["inner_type"] = parsed.payload.inner.inner_type
-                self._dispatch_parsed_message(parsed)
+        if parsed is not None:
+            event_data["message_type"] = parsed.message_type
+            event_data["source_device"] = parsed.device_name
+            if parsed.payload and parsed.payload.inner:
+                event_data["inner_type"] = inner_type_str
 
         self._recent_messages.append(event_data)
         self.hass.bus.async_fire("petkit_mqtt_message", event_data)
 
         self._schedule_refresh()
-
-    def _dispatch_parsed_message(self, parsed: ParsedIoTMessage) -> None:
-        """Dispatch a parsed MQTT message. Future: map types to coordinator updates."""
-        inner_type = None
-        if parsed.payload and parsed.payload.inner:
-            inner_type = parsed.payload.inner.inner_type
-
-        LOGGER.debug(
-            "Petkit MQTT parsed: type=%s device=%s inner_type=%s",
-            parsed.message_type,
-            parsed.device_name,
-            inner_type,
-        )
 
     def get_recent_messages(
         self, *, limit: int = 1, topic_contains: str | None = None

@@ -19,6 +19,7 @@ from homeassistant.const import (
     CONF_USERNAME,
     Platform,
 )
+from homeassistant.core import SupportsResponse
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
@@ -240,13 +241,13 @@ async def async_setup_entry(
             }
         )
 
-        async def _async_mqtt_dump(call) -> None:  # noqa: ANN001
+        async def _async_mqtt_dump(call):  # noqa: ANN001
             target_entry_id = call.data.get("entry_id")
             limit = call.data["limit"]
             topic_contains = call.data.get("topic_contains")
 
+            accounts = []
             messages: list[dict] = []
-            found_listener = False
             for ent in hass.config_entries.async_entries(DOMAIN):
                 if target_entry_id and ent.entry_id != target_entry_id:
                     continue
@@ -254,25 +255,22 @@ async def async_setup_entry(
                 mqtt_enabled = ent.options.get(CONF_REALTIME_MQTT, DEFAULT_REALTIME_MQTT)
                 listener = getattr(runtime, "mqtt_listener", None)
 
-                if mqtt_enabled and listener is None:
-                    LOGGER.warning(
-                        "Petkit MQTT dump: MQTT is enabled for %s but no listener is running",
-                        ent.title,
-                    )
-                    continue
-
                 if listener is None:
+                    accounts.append({
+                        "account": ent.title,
+                        "entry_id": ent.entry_id,
+                        "mqtt_enabled": mqtt_enabled,
+                        "status": "no_listener",
+                    })
                     continue
 
-                found_listener = True
                 diag = listener.diagnostics
-                LOGGER.info(
-                    "Petkit MQTT dump: account=%s status=%s messages_received=%s buffer_size=%s",
-                    ent.title,
-                    diag["status"],
-                    diag["messages_received"],
-                    diag["buffer_size"],
-                )
+                accounts.append({
+                    "account": ent.title,
+                    "entry_id": ent.entry_id,
+                    "mqtt_enabled": mqtt_enabled,
+                    **diag,
+                })
 
                 for msg in listener.get_recent_messages(
                     limit=limit, topic_contains=topic_contains
@@ -282,29 +280,16 @@ async def async_setup_entry(
                     enriched["account"] = ent.title
                     messages.append(enriched)
 
-            if not found_listener:
-                LOGGER.info("Petkit MQTT dump: no MQTT listeners active")
-            elif not messages:
-                LOGGER.info("Petkit MQTT dump: no messages available")
-            else:
-                LOGGER.info("Petkit MQTT dump: dumping %s message(s)", len(messages))
-                for msg in messages:
-                    LOGGER.info(
-                        "Petkit MQTT dump entry=%s topic=%s payload_encoding=%s received_at=%s payload=%s",
-                        msg.get("entry_id"),
-                        msg.get("topic"),
-                        msg.get("payload_encoding"),
-                        msg.get("received_at"),
-                        msg.get("payload"),
-                    )
-
-            hass.bus.async_fire(EVENT_MQTT_DUMP, {"messages": messages})
+            result = {"accounts": accounts, "messages": messages}
+            hass.bus.async_fire(EVENT_MQTT_DUMP, result)
+            return result
 
         hass.services.async_register(
             DOMAIN,
             SERVICE_MQTT_DUMP,
             _async_mqtt_dump,
             schema=schema,
+            supports_response=SupportsResponse.OPTIONAL,
         )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -48,6 +48,7 @@ from .const import (
     CONF_REALTIME_MQTT,
     CONF_SCAN_INTERVAL_BLUETOOTH,
     CONF_SCAN_INTERVAL_MEDIA,
+    CONF_STREAM_CONTROL_MODE,
     CONF_SMART_POLLING,
     COUNTRY_TO_CODE_DICT,
     DEFAULT_BLUETOOTH_RELAY,
@@ -60,10 +61,13 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_BLUETOOTH,
     DEFAULT_SCAN_INTERVAL_MEDIA,
+    DEFAULT_STREAM_CONTROL_MODE,
     DEFAULT_SMART_POLLING,
     DOMAIN,
     LOGGER,
     MEDIA_SECTION,
+    STREAM_CONTROL_EXCLUSIVE,
+    STREAM_CONTROL_SHARED,
 )
 
 
@@ -99,6 +103,20 @@ class PetkitOptionsFlowHandler(OptionsFlow):
                             CONF_REALTIME_MQTT, DEFAULT_REALTIME_MQTT
                         ),
                     ): BooleanSelector(BooleanSelectorConfig()),
+                    vol.Required(
+                        CONF_STREAM_CONTROL_MODE,
+                        default=self.config_entry.options.get(
+                            CONF_STREAM_CONTROL_MODE,
+                            DEFAULT_STREAM_CONTROL_MODE,
+                        ),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                STREAM_CONTROL_SHARED,
+                                STREAM_CONTROL_EXCLUSIVE,
+                            ]
+                        )
+                    ),
                     vol.Required(MEDIA_SECTION): section(
                         vol.Schema(
                             {
@@ -255,6 +273,7 @@ class PetkitFlowHandler(ConfigFlow, domain=DOMAIN):
                             CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL,
                             CONF_SMART_POLLING: DEFAULT_SMART_POLLING,
                             CONF_REALTIME_MQTT: DEFAULT_REALTIME_MQTT,
+                            CONF_STREAM_CONTROL_MODE: DEFAULT_STREAM_CONTROL_MODE,
                             MEDIA_SECTION: {
                                 CONF_MEDIA_PATH: DEFAULT_MEDIA_PATH,
                                 CONF_SCAN_INTERVAL_MEDIA: DEFAULT_SCAN_INTERVAL_MEDIA,

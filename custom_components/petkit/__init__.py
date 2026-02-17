@@ -58,6 +58,7 @@ PLATFORMS: list[Platform] = [
     Platform.LIGHT,
     Platform.TEXT,
     Platform.BUTTON,
+    Platform.CAMERA,
     Platform.NUMBER,
     Platform.SELECT,
     Platform.IMAGE,
@@ -94,6 +95,7 @@ class PetkitSessionView(HomeAssistantView):
                     "username": account_username,
                     "session_id": client._session.id,
                     "base_url": client.req.base_url,
+                    "region": entry.data.get(CONF_REGION, ""),
                 })
 
         if username_filter:

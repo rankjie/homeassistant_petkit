@@ -19,6 +19,10 @@ EVENT_MQTT_DUMP = "petkit_mqtt_dump"
 CONF_SCAN_INTERVAL_MEDIA = "scan_interval_media"
 CONF_SMART_POLLING = "smart_polling"
 CONF_REALTIME_MQTT = "realtime_mqtt"
+CONF_STREAM_CONTROL_MODE = "stream_control_mode"
+
+STREAM_CONTROL_SHARED = "shared"
+STREAM_CONTROL_EXCLUSIVE = "exclusive"
 
 BT_SECTION = "bluetooth_options"
 CONF_BLE_RELAY_ENABLED = "ble_relay_enabled"
@@ -35,6 +39,7 @@ CONF_MEDIA_PATH = "media_path"
 DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_SCAN_INTERVAL_MEDIA = 15
 DEFAULT_SCAN_INTERVAL_BLUETOOTH = 30
+DEFAULT_STREAM_CONTROL_MODE = STREAM_CONTROL_SHARED
 DEFAULT_EVENTS = [
     "Pet",
     "Eat",

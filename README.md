@@ -2,12 +2,16 @@
 
 [![GitHub Release][releases-shield]][releases] [![HACS Default](https://img.shields.io/badge/HACS-Default-blue.svg?style=for-the-badge&color=41BDF5)](https://hacs.xyz/docs/faq/custom_repositories)
 
+> **Fork notice:** This is a development fork of [Jezza34000/homeassistant_petkit](https://github.com/Jezza34000/homeassistant_petkit) with additional features for live streaming, MQTT, and camera-equipped litter boxes.
+
 ## 🚀 Features
 
-- **Control** : Control your Petkit devices directly from Home Assistant.
-- **Monitor** : Monitor your devices status, monitor your pet's activity, feeding, drinking, and litter usage.
-- **Bluetooth relay** : Automatically check your fountain over bluetooth relay.
-- **Media** : Access all your media from Petkit devices directly in Home Assistant.
+All upstream features, plus:
+
+- **Session HTTP endpoint** : `GET /api/petkit/session` exposes the authenticated PetKit session so the [Scrypted PetKit plugin](https://github.com/rankjie/scrypted-petkit) can reuse credentials without a separate login.
+- **IoT HTTP endpoint** : `GET /api/petkit/iot` exposes IoT MQTT credentials (deviceName, deviceSecret, productKey, mqttHost) for external MQTT consumers.
+- **Privacy mode fix** : Toggling privacy mode off no longer resets `cameraInward` setting, matching the Android app behavior.
+- **MQTT listener (experimental)** : Connects to PetKit's Aliyun IoT MQTT broker. Messages don't contain updated device data — they only serve as a cue that something changed. May be useful for triggering faster polling in the future.
 
 ## 📘 Integration Wiki
 
@@ -20,6 +24,35 @@
 - **[Translations](https://github.com/Jezza34000/homeassistant_petkit/wiki/Translations)** - Language support and contribution guide
 - **[Troubleshooting](https://github.com/Jezza34000/homeassistant_petkit/wiki/Troubleshooting)** - Solutions to common problems
 - **[Development](https://github.com/Jezza34000/homeassistant_petkit/wiki/Development)** - Guide for contributors
+
+## 🔌 HTTP API Endpoints
+
+These endpoints require a valid Home Assistant long-lived access token (`Authorization: Bearer <token>`).
+
+### `GET /api/petkit/session`
+
+Returns the authenticated PetKit API session for external consumers.
+
+```json
+{
+  "token": "...",
+  "id": "...",
+  "region": "..."
+}
+```
+
+### `GET /api/petkit/iot`
+
+Returns IoT MQTT credentials for connecting to PetKit's Aliyun IoT broker.
+
+```json
+{
+  "deviceName": "...",
+  "deviceSecret": "...",
+  "productKey": "...",
+  "mqttHost": "..."
+}
+```
 
 ## 🛟 Need help?
 

@@ -15,6 +15,7 @@ from pypetkitapi import (
     DEVICES_FEEDER,
     DEVICES_LITTER_BOX,
     DEVICES_WATER_FOUNTAIN,
+    FEEDER_WITH_CAMERA,
     LITTER_WITH_CAMERA,
     T4,
     T5,
@@ -50,14 +51,74 @@ class PetKitButtonDesc(PetKitDescSensorBase, ButtonEntityDescription):
     """A class that describes sensor entities."""
 
     action: Callable[PetkitConfigEntry]
-    is_available: Callable[[PetkitDevices], bool] | None = None
+    is_available: Callable[[PetkitDevices | None], bool] | None = None
+    enable_smart_polling: bool = True
+    refresh_after_press: bool = True
 
 
 COMMON_ENTITIES = []
 
+
+def _camera_controller_available(device: PetkitDevices | None) -> bool:
+    """Return True when camera controller is loaded for the device."""
+    if device is None:
+        return False
+
+    from .camera import get_camera_controller
+
+    return get_camera_controller(str(device.id)) is not None
+
+
+async def _start_live_action(_api, device: PetkitDevices) -> None:
+    """Trigger manual start_live for camera-capable devices."""
+    from .camera import get_camera_controller
+
+    controller = get_camera_controller(str(device.id))
+    if controller is None:
+        LOGGER.warning(
+            "Start Live button pressed but no camera controller for %s",
+            device.id,
+        )
+        return
+
+    await controller.async_start_live_manual()
+
+
+async def _stop_live_action(_api, device: PetkitDevices) -> None:
+    """Trigger manual stop_live for camera-capable devices."""
+    from .camera import get_camera_controller
+
+    controller = get_camera_controller(str(device.id))
+    if controller is None:
+        LOGGER.warning(
+            "Stop Live button pressed but no camera controller for %s",
+            device.id,
+        )
+        return
+
+    await controller.async_stop_live_manual()
+
 BUTTON_MAPPING: dict[type[PetkitDevices], list[PetKitButtonDesc]] = {
     Feeder: [
         *COMMON_ENTITIES,
+        PetKitButtonDesc(
+            key="Start live",
+            translation_key="start_live",
+            action=_start_live_action,
+            only_for_types=FEEDER_WITH_CAMERA,
+            is_available=_camera_controller_available,
+            enable_smart_polling=False,
+            refresh_after_press=False,
+        ),
+        PetKitButtonDesc(
+            key="Stop live",
+            translation_key="stop_live",
+            action=_stop_live_action,
+            only_for_types=FEEDER_WITH_CAMERA,
+            is_available=_camera_controller_available,
+            enable_smart_polling=False,
+            refresh_after_press=False,
+        ),
         PetKitButtonDesc(
             key="Reset desiccant",
             translation_key="reset_desiccant",
@@ -93,6 +154,24 @@ BUTTON_MAPPING: dict[type[PetkitDevices], list[PetKitButtonDesc]] = {
     ],
     Litter: [
         *COMMON_ENTITIES,
+        PetKitButtonDesc(
+            key="Start live",
+            translation_key="start_live",
+            action=_start_live_action,
+            only_for_types=LITTER_WITH_CAMERA,
+            is_available=_camera_controller_available,
+            enable_smart_polling=False,
+            refresh_after_press=False,
+        ),
+        PetKitButtonDesc(
+            key="Stop live",
+            translation_key="stop_live",
+            action=_stop_live_action,
+            only_for_types=LITTER_WITH_CAMERA,
+            is_available=_camera_controller_available,
+            enable_smart_polling=False,
+            refresh_after_press=False,
+        ),
         PetKitButtonDesc(
             key="Scoop",
             translation_key="start_scoop",
@@ -324,9 +403,11 @@ class PetkitButton(PetkitEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Handle the button press."""
         LOGGER.debug("Button pressed: %s", self.entity_description.key)
-        self.coordinator.enable_smart_polling(12)
+        if self.entity_description.enable_smart_polling:
+            self.coordinator.enable_smart_polling(12)
         await self.entity_description.action(
             self.coordinator.config_entry.runtime_data.client, self.device
         )
-        await asyncio.sleep(1.5)
-        await self.coordinator.async_request_refresh()
+        if self.entity_description.refresh_after_press:
+            await asyncio.sleep(1.5)
+            await self.coordinator.async_request_refresh()

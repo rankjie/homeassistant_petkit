@@ -33,6 +33,12 @@ from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetKitDescSensorBase, PetkitCameraBaseEntity
 
 AGORA_APP_ID = "244c49951296440cbc1e3b937bf5e410"
+_CAMERA_CONTROLLERS: dict[str, "PetkitWebRTCCamera"] = {}
+
+
+def get_camera_controller(device_id: str) -> "PetkitWebRTCCamera | None":
+    """Return active camera controller for one device id."""
+    return _CAMERA_CONTROLLERS.get(str(device_id))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -135,6 +141,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     async def async_added_to_hass(self) -> None:
         """Register ICE callback when entity is added."""
         await super().async_added_to_hass()
+        _CAMERA_CONTROLLERS[str(self.device.id)] = self
         self._remove_ice_servers = async_register_ice_servers(
             self.hass,
             self.get_ice_servers,
@@ -145,6 +152,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if self._remove_ice_servers:
             self._remove_ice_servers()
             self._remove_ice_servers = None
+        _CAMERA_CONTROLLERS.pop(str(self.device.id), None)
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -218,7 +226,15 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 send_message(WebRTCAnswer(answer_sdp))
                 return
 
+            # First attempt failed — try temporaryOpenCamera and retry once
             await self._async_close_stream()
+            retry_answer = await self._retry_with_temporary_open(
+                offer_sdp, session_id
+            )
+            if retry_answer:
+                send_message(WebRTCAnswer(retry_answer))
+                return
+
             send_message(
                 WebRTCError(
                     code="webrtc_negotiation_failed",
@@ -252,9 +268,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         """Return cached Agora ICE servers for Home Assistant frontend."""
         return self._ice_servers
 
-    async def _async_close_stream(self) -> None:
+    async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
         """Stop signaling control (mode-dependent) and close websocket session."""
-        send_stop = self._stream_control_mode() == STREAM_CONTROL_EXCLUSIVE
+        send_stop = (
+            send_stop_override
+            if send_stop_override is not None
+            else self._stream_control_mode() == STREAM_CONTROL_EXCLUSIVE
+        )
         results = await asyncio.gather(
             self._agora_rtm.stop_live(send_stop=send_stop),
             self._agora_handler.disconnect(),
@@ -267,6 +287,69 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                     self.device.id,
                     result,
                 )
+
+    async def _retry_with_temporary_open(
+        self, offer_sdp: str, session_id: str
+    ) -> str | None:
+        """Call temporaryOpenCamera, re-fetch tokens, and retry WebRTC once."""
+        device_type = getattr(self.device, "device_nfo", None)
+        if device_type is None:
+            return None
+        dt = device_type.device_type
+
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            await client.temporary_open_camera(dt, self.device.id)
+        except Exception:
+            LOGGER.debug(
+                "temporaryOpenCamera skipped/failed for %s", self.device.id
+            )
+
+        # Re-fetch live feed tokens after waking the camera
+        await self.coordinator.async_request_refresh()
+        live_feed = self._get_live_feed()
+        if live_feed is None:
+            return None
+
+        await self._refresh_agora_context(live_feed)
+        if self._agora_response is None:
+            return None
+
+        await self._agora_rtm.start_live(live_feed)
+
+        return await self._agora_handler.connect_and_join(
+            live_feed=live_feed,
+            offer_sdp=offer_sdp,
+            session_id=session_id,
+            app_id=AGORA_APP_ID,
+            agora_response=self._agora_response,
+        )
+
+    async def async_start_live_manual(self) -> bool:
+        """Start RTM live signaling manually from HA controls."""
+        live_feed = await self._async_get_live_feed(refresh=True)
+        if live_feed is None:
+            LOGGER.warning(
+                "Manual start_live failed for %s: live feed token unavailable",
+                self.device.id,
+            )
+            return False
+
+        started = await self._agora_rtm.start_live(live_feed)
+        if not started:
+            LOGGER.warning(
+                "Manual start_live failed for %s: RTM signaling not acknowledged",
+                self.device.id,
+            )
+            return False
+
+        LOGGER.debug("Manual start_live succeeded for %s", self.device.id)
+        return True
+
+    async def async_stop_live_manual(self) -> None:
+        """Stop RTM live signaling manually from HA controls."""
+        await self._async_close_stream(send_stop_override=True)
+        LOGGER.debug("Manual stop_live sent for %s", self.device.id)
 
     def _stream_control_mode(self) -> str:
         """Return stream control mode from config entry options."""

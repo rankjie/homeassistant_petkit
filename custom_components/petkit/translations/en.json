@@ -176,6 +176,12 @@
       "start_maintenance": {
         "name": "Maintenance : Start"
       },
+      "start_live": {
+        "name": "Start live"
+      },
+      "stop_live": {
+        "name": "Stop live"
+      },
       "start_scoop": {
         "name": "Scoop"
       },

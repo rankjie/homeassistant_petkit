@@ -227,8 +227,14 @@
       "start_maintenance": {
         "default": "mdi:progress-wrench"
       },
+      "start_live": {
+        "default": "mdi:play-circle-outline"
+      },
       "start_scoop": {
         "default": "mdi:broom"
+      },
+      "stop_live": {
+        "default": "mdi:stop-circle-outline"
       }
     },
     "image": {

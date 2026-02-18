@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from pypetkitapi import FEEDER_WITH_CAMERA, LITTER_WITH_CAMERA, Feeder, Litter, LiveFeed
+from pypetkitapi import (
+    FEEDER_WITH_CAMERA,
+    LITTER_WITH_CAMERA,
+    TEMP_CAMERA_TYPES,
+    Feeder,
+    Litter,
+    LiveFeed,
+)
 from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
 from homeassistant.components.camera import (
@@ -33,6 +41,7 @@ from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetKitDescSensorBase, PetkitCameraBaseEntity
 
 AGORA_APP_ID = "244c49951296440cbc1e3b937bf5e410"
+TEMP_OPEN_CAMERA_COOLDOWN_SECONDS = 45.0
 _CAMERA_CONTROLLERS: dict[str, "PetkitWebRTCCamera"] = {}
 
 
@@ -130,6 +139,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         )
         self._agora_response: AgoraResponse | None = None
         self._ice_servers: list[RTCIceServer] = []
+        self._last_temporary_open_at = 0.0
 
         self._remove_ice_servers: Callable[[], None] | None = None
 
@@ -182,6 +192,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._agora_handler.candidates = []
 
         try:
+            await self._maybe_temporary_open_camera()
             live_feed = await self._async_get_live_feed(refresh=True)
             if live_feed is None:
                 send_message(
@@ -292,18 +303,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self, offer_sdp: str, session_id: str
     ) -> str | None:
         """Call temporaryOpenCamera, re-fetch tokens, and retry WebRTC once."""
-        device_type = getattr(self.device, "device_nfo", None)
-        if device_type is None:
-            return None
-        dt = device_type.device_type
-
-        client = self.coordinator.config_entry.runtime_data.client
-        try:
-            await client.temporary_open_camera(dt, self.device.id)
-        except Exception:
-            LOGGER.debug(
-                "temporaryOpenCamera skipped/failed for %s", self.device.id
-            )
+        await self._maybe_temporary_open_camera(force=True)
 
         # Re-fetch live feed tokens after waking the camera
         await self.coordinator.async_request_refresh()
@@ -324,6 +324,34 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             app_id=AGORA_APP_ID,
             agora_response=self._agora_response,
         )
+
+    async def _maybe_temporary_open_camera(self, force: bool = False) -> None:
+        """Best-effort temporaryOpenCamera with a short per-device cooldown."""
+        device_nfo = getattr(self.device, "device_nfo", None)
+        if device_nfo is None:
+            return
+
+        device_type = str(device_nfo.device_type or "").lower()
+        if not device_type or device_type not in TEMP_CAMERA_TYPES:
+            return
+
+        now = time.monotonic()
+        if (
+            not force
+            and (now - self._last_temporary_open_at) < TEMP_OPEN_CAMERA_COOLDOWN_SECONDS
+        ):
+            return
+
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            await client.temporary_open_camera(device_type, self.device.id)
+            self._last_temporary_open_at = now
+        except Exception as err:
+            LOGGER.debug(
+                "temporaryOpenCamera skipped/failed for %s: %s",
+                self.device.id,
+                err,
+            )
 
     async def async_start_live_manual(self) -> bool:
         """Start RTM live signaling manually from HA controls."""

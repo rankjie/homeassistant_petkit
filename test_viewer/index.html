@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PetKit Camera Test</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 20px; }
+  h1 { font-size: 1.3rem; margin-bottom: 16px; color: #7fdbca; }
+  .container { max-width: 900px; margin: 0 auto; }
+
+  /* Panels */
+  .panel { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 1rem; margin-bottom: 12px; color: #82aaff; }
+
+  /* Form */
+  .form-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .form-row label { display: flex; flex-direction: column; flex: 1; min-width: 140px; font-size: 0.8rem; color: #999; }
+  .form-row input, .form-row select { margin-top: 4px; padding: 6px 10px; border: 1px solid #334; border-radius: 4px;
+    background: #0f3460; color: #e0e0e0; font-size: 0.9rem; }
+  .form-row input:focus, .form-row select:focus { outline: none; border-color: #7fdbca; }
+
+  /* Buttons */
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { padding: 8px 18px; border: none; border-radius: 4px; font-size: 0.85rem;
+           cursor: pointer; font-weight: 600; transition: opacity 0.15s; }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-login { background: #82aaff; color: #0a0a23; }
+  .btn-start { background: #22da6e; color: #0a0a23; }
+  .btn-stop  { background: #ff5370; color: #fff; }
+
+  /* Video */
+  .video-wrap { position: relative; background: #000; border-radius: 8px; overflow: hidden;
+                width: 100%; max-width: 528px; aspect-ratio: 1 / 1; margin: 0 auto; }
+  video { width: 100%; height: 100%; object-fit: contain; }
+  .video-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                   color: #555; font-size: 0.9rem; pointer-events: none; }
+  .video-wrap.playing .video-overlay { display: none; }
+
+  /* Status */
+  .status { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; display: inline-block; }
+  .status-idle      { background: #334; color: #888; }
+  .status-connected { background: #1b4332; color: #52b788; }
+  .status-error     { background: #3d0000; color: #ff5370; }
+  .status-loading   { background: #2d2b00; color: #ffd166; }
+
+  /* Log */
+  #log { max-height: 240px; overflow-y: auto; font-family: "SF Mono", "Fira Code", monospace;
+         font-size: 0.75rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+         color: #8892b0; background: #0a0a23; border-radius: 6px; padding: 10px; }
+  .log-info  { color: #82aaff; }
+  .log-ok    { color: #22da6e; }
+  .log-warn  { color: #ffd166; }
+  .log-error { color: #ff5370; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>PetKit Camera Test Viewer</h1>
+
+  <!-- Login -->
+  <div class="panel" id="loginPanel">
+    <h2>1. Connect</h2>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn-login" id="btnLogin">Discover Devices</button>
+      <span class="status status-idle" id="loginStatus">idle</span>
+    </div>
+  </div>
+
+  <!-- Device & Stream -->
+  <div class="panel" id="streamPanel" style="display:none">
+    <h2>2. Stream</h2>
+    <div class="form-row">
+      <label>Device
+        <select id="deviceSelect"></select>
+      </label>
+    </div>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn-start" id="btnStart">Start Stream</button>
+      <button class="btn-stop" id="btnStop" disabled>Stop Stream</button>
+      <span class="status status-idle" id="streamStatus">idle</span>
+    </div>
+
+    <div class="video-wrap" id="videoWrap" style="margin-top:16px">
+      <video id="remoteVideo" autoplay playsinline muted></video>
+      <div class="video-overlay">No stream</div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+
+const logEl = $('#log');
+function log(msg, cls = 'log-info') {
+  const ts = new Date().toLocaleTimeString();
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = `[${ts}] ${msg}\n`;
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = `status ${cls}`;
+}
+
+let pc = null;
+let devices = [];
+let candidates = [];
+
+// -------------------------------------------------------------------------
+// Login
+// -------------------------------------------------------------------------
+$('#btnLogin').addEventListener('click', async () => {
+  const btn = $('#btnLogin');
+  btn.disabled = true;
+  setStatus('#loginStatus', 'logging in...', 'status-loading');
+  log('Logging in...');
+
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    devices = data.devices || [];
+    log(`Found ${devices.length} camera device(s)`, 'log-ok');
+
+    const sel = $('#deviceSelect');
+    sel.innerHTML = '';
+    for (const d of devices) {
+      const opt = document.createElement('option');
+      opt.value = d.id;
+      const acct = d.account ? ` @${d.account}` : '';
+      opt.textContent = `${d.name} (${d.type}) [${d.id}]${acct}${d.hasLiveFeed ? '' : ' - no live feed'}`;
+      sel.appendChild(opt);
+    }
+
+    setStatus('#loginStatus', 'connected', 'status-connected');
+    $('#streamPanel').style.display = '';
+  } catch (e) {
+    log(`Login failed: ${e.message}`, 'log-error');
+    setStatus('#loginStatus', 'error', 'status-error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// -------------------------------------------------------------------------
+// Start stream
+// -------------------------------------------------------------------------
+$('#btnStart').addEventListener('click', async () => {
+  const deviceId = $('#deviceSelect').value;
+  if (!deviceId) return;
+
+  $('#btnStart').disabled = true;
+  $('#btnStop').disabled = false;
+  setStatus('#streamStatus', 'starting...', 'status-loading');
+  log(`Starting stream for device ${deviceId}...`);
+
+  try {
+    // 1. Start live (tokens + RTM)
+    const startRes = await fetch('/api/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId }),
+    });
+    const startData = await startRes.json();
+    if (!startRes.ok) throw new Error(startData.error || `HTTP ${startRes.status}`);
+
+    log(`Channel: ${startData.channel}, RTM: ${startData.rtmOk}, ICE servers: ${startData.iceServers.length}`, 'log-ok');
+
+    // 2. Create PeerConnection
+    if (pc) { pc.close(); pc = null; }
+    candidates = [];
+
+    const config = { iceServers: startData.iceServers };
+    pc = new RTCPeerConnection(config);
+
+    pc.ontrack = (ev) => {
+      log('Got remote track: ' + ev.track.kind, 'log-ok');
+      if (ev.track.kind === 'video') {
+        $('#remoteVideo').srcObject = ev.streams[0] || new MediaStream([ev.track]);
+        $('#videoWrap').classList.add('playing');
+      }
+    };
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        candidates.push({
+          candidate: ev.candidate.candidate,
+          sdpMid: ev.candidate.sdpMid,
+          sdpMLineIndex: ev.candidate.sdpMLineIndex,
+        });
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE state: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setStatus('#streamStatus', 'streaming', 'status-connected');
+      } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        setStatus('#streamStatus', pc.iceConnectionState, 'status-error');
+      }
+    };
+
+    // Add recvonly transceivers (we only want to receive)
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // 3. Create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log(`SDP offer created (${offer.sdp.length} bytes)`);
+
+    // Brief wait for ICE gathering
+    await new Promise(r => setTimeout(r, 500));
+
+    // 4. Send offer to server
+    log('Sending offer to server...');
+    const offerRes = await fetch('/api/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        offer: pc.localDescription.sdp,
+        sessionId: 'test-' + Date.now(),
+        candidates,
+      }),
+    });
+    const offerData = await offerRes.json();
+    if (!offerRes.ok) throw new Error(offerData.error || `HTTP ${offerRes.status}`);
+
+    log(`SDP answer received (${offerData.answer.length} bytes)`, 'log-ok');
+
+    // 5. Set remote description
+    await pc.setRemoteDescription({ type: 'answer', sdp: offerData.answer });
+    log('Remote description set', 'log-ok');
+    setStatus('#streamStatus', 'negotiated', 'status-connected');
+
+  } catch (e) {
+    log(`Stream start failed: ${e.message}`, 'log-error');
+    setStatus('#streamStatus', 'error', 'status-error');
+    $('#btnStart').disabled = false;
+    $('#btnStop').disabled = true;
+  }
+});
+
+// -------------------------------------------------------------------------
+// Stop stream
+// -------------------------------------------------------------------------
+$('#btnStop').addEventListener('click', async () => {
+  log('Stopping stream...');
+  if (pc) { pc.close(); pc = null; }
+  $('#remoteVideo').srcObject = null;
+  $('#videoWrap').classList.remove('playing');
+
+  try {
+    await fetch('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {
+    log(`Stop error: ${e.message}`, 'log-warn');
+  }
+
+  setStatus('#streamStatus', 'stopped', 'status-idle');
+  $('#btnStart').disabled = false;
+  $('#btnStop').disabled = true;
+  log('Stream stopped', 'log-ok');
+});
+</script>
+</body>
+</html>

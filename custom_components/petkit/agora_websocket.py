@@ -61,7 +61,6 @@ class AgoraWebSocketHandler:
         rtc_token_provider: Callable[[], Awaitable[str | None]] | None = None,
         *,
         prefer_instant_video: bool = False,
-        defer_media_start: bool = False,
         subscribe_retry_delay: float = 0.0,
         subscribe_retry_attempts: int = 0,
     ) -> None:
@@ -85,9 +84,6 @@ class AgoraWebSocketHandler:
         self._rtc_token: str | None = None
         self._rtc_token_provider = rtc_token_provider
         self._prefer_instant_video = prefer_instant_video
-        self._defer_media_start = defer_media_start
-        self._media_start_active = not defer_media_start
-        self._pending_client_role: tuple[str, int] | None = None
         self._subscribe_retry_delay = subscribe_retry_delay
         self._subscribe_retry_attempts = subscribe_retry_attempts
 
@@ -107,12 +103,6 @@ class AgoraWebSocketHandler:
     def add_ice_candidate(self, candidate: RTCIceCandidateInit) -> None:
         """Collect browser ICE candidates before join_v3."""
         self.candidates.append(candidate)
-
-    def configure_media_start(self, *, defer_media_start: bool) -> None:
-        """Configure whether role/subscription messages are deferred."""
-        self._defer_media_start = defer_media_start
-        self._media_start_active = not defer_media_start
-        self._pending_client_role = None
 
     async def connect_and_join(
         self,
@@ -268,7 +258,7 @@ class AgoraWebSocketHandler:
                     continue
 
                 message_type = response.get("_type", "")
-                LOGGER.debug("WS ← [%s] %s", message_type, response)  # ← AJOUTE
+                LOGGER.debug("WS ← [%s] %s", message_type, response)
 
                 if message_type in self._message_handlers:
                     await self._message_handlers[message_type](response)
@@ -343,10 +333,7 @@ class AgoraWebSocketHandler:
             LOGGER.error("join_v3 success did not include ORTC parameters")
             return None
 
-        if self._defer_media_start:
-            self._pending_client_role = ("host", 0)
-        else:
-            await self._send_set_client_role(role="host", level=0)
+        await self._send_set_client_role(role="host", level=0)
         await self._register_existing_video_streams(message)
 
         # Inject auth fingerprints if not present in ORTC payload.
@@ -515,46 +502,7 @@ class AgoraWebSocketHandler:
         """Subscribe once per `(uid, ssrc_id)` pair."""
         if (uid, ssrc_id) in self._subscribed_video_streams:
             return
-        if not self._media_start_active:
-            LOGGER.debug(
-                "Agora deferred subscribe: uid=%s ssrc=%s waiting for activation",
-                uid,
-                ssrc_id,
-            )
-            return
         await self._send_subscribe(stream_id=uid, ssrc_id=ssrc_id, codec="h264")
-
-    async def activate_media_start(self, delay: float = 0.0) -> None:
-        """Enable deferred role/subscription signaling after answer delivery."""
-        if self._media_start_active:
-            return
-
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-        if not self._websocket or self._connection_state != "CONNECTED":
-            return
-
-        self._media_start_active = True
-
-        if self._pending_client_role is not None:
-            role, level = self._pending_client_role
-            await self._send_set_client_role(role=role, level=level)
-            self._pending_client_role = None
-
-        pending = [
-            (uid, data.get("ssrcId"))
-            for uid, data in self._video_streams.items()
-            if isinstance(data.get("ssrcId"), int)
-        ]
-        if pending:
-            LOGGER.debug(
-                "Agora activating deferred media start for %d streams",
-                len(pending),
-            )
-
-        for uid, ssrc_id in pending:
-            await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
 
     async def _register_existing_video_streams(self, payload: Any) -> None:
         """Subscribe to any already-published video streams present in join payload."""
@@ -618,8 +566,6 @@ class AgoraWebSocketHandler:
                 await asyncio.sleep(self._subscribe_retry_delay)
                 if not self._websocket or self._connection_state != "CONNECTED":
                     return
-                if not self._media_start_active:
-                    continue
 
                 pending = [
                     (uid, data.get("ssrcId"))
@@ -677,7 +623,7 @@ class AgoraWebSocketHandler:
                 "process_id": process_id,
                 "mode": "live",
                 "codec": "h264",
-                "role": "audience" if self._defer_media_start else "host",
+                "role": "host",
                 "has_changed_gateway": False,
                 "ap_response": agora_response.to_ap_response(
                     RESPONSE_FLAGS["CHOOSE_SERVER"]
@@ -693,9 +639,7 @@ class AgoraWebSocketHandler:
                         "maxSubscription": 50,
                         "enableUserLicenseCheck": True,
                         "enableRTX": True,
-                        "enableInstantVideo": (
-                            self._prefer_instant_video and not self._defer_media_start
-                        ),
+                        "enableInstantVideo": self._prefer_instant_video,
                         "enableDataStream2": False,
                         "enableAutFeedback": True,
                         "enableUserAutoRebalanceCheck": True,
@@ -1078,7 +1022,5 @@ class AgoraWebSocketHandler:
 
         self._joined = False
         self._connection_state = "DISCONNECTED"
-        self._media_start_active = not self._defer_media_start
-        self._pending_client_role = None
         self._video_streams.clear()
         self._subscribed_video_streams.clear()

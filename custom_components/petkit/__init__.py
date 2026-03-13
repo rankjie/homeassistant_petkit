@@ -39,7 +39,6 @@ from .coordinator import (
 )
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
-from .whep import PetkitWhepView, async_cleanup_whep_sessions
 from .whep_mirror import (
     PetkitWhepMirrorView,
     async_cleanup_whep_mirror_sessions,
@@ -118,7 +117,6 @@ async def async_setup_entry(
 
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitSessionView())
-    hass.http.register_view(PetkitWhepView())
     hass.http.register_view(PetkitWhepMirrorView())
 
     country_from_ha = hass.config.country
@@ -202,7 +200,6 @@ async def async_unload_entry(
     if mqtt_listener is not None:
         await mqtt_listener.async_stop()
 
-    await async_cleanup_whep_sessions(hass)
     await async_cleanup_whep_mirror_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

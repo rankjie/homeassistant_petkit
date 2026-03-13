@@ -16,9 +16,9 @@ from .agora_api import SERVICE_IDS, AgoraAPIClient
 from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
-from .whep import (
+from .webrtc_common import (
     _add_offer_candidates,
-    _get_live_feed_for_whep,
+    _get_live_feed_for_webrtc,
     _resolve_agora_user_id,
 )
 
@@ -247,10 +247,17 @@ class PetkitMirrorRelayManager:
             and upstream.peer_connection.connectionState not in {"failed", "closed"}
         )
 
-    async def has_downstream(self, device_id: str, session_id: str) -> bool:
-        """Return whether a relay downstream session exists."""
+    async def get_upstream_rtm(self, device_id: str) -> AgoraRTMSignaling | None:
+        """Return the active upstream RTM session for one device."""
         async with self._lock:
-            return session_id in self._downstreams.get(device_id, {})
+            upstream = self._upstreams.get(device_id)
+        if (
+            upstream is None
+            or not upstream.video_ready.is_set()
+            or upstream.peer_connection.connectionState in {"failed", "closed"}
+        ):
+            return None
+        return upstream.agora_rtm
 
     async def _ensure_upstream(
         self,
@@ -271,7 +278,7 @@ class PetkitMirrorRelayManager:
         if existing is not None:
             await self.close_device(device_id)
 
-        live_feed = await _get_live_feed_for_whep(camera)
+        live_feed = await _get_live_feed_for_webrtc(camera)
         if live_feed is None:
             raise RuntimeError("Live feed unavailable or missing RTM credentials")
 
@@ -406,7 +413,7 @@ class PetkitMirrorRelayManager:
         try:
             while True:
                 await asyncio.sleep(TOKEN_REFRESH_INTERVAL_SECONDS)
-                live_feed = await _get_live_feed_for_whep(upstream.camera)
+                live_feed = await _get_live_feed_for_webrtc(upstream.camera)
                 if live_feed is None:
                     continue
                 await upstream.agora_rtm.update_tokens(live_feed)

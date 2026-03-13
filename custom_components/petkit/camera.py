@@ -18,6 +18,7 @@ from homeassistant.components.camera import (
 from homeassistant.components.web_rtc import async_register_ice_servers
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.network import NoURLAvailableError, get_url
 
 from .agora_api import SERVICE_IDS, AgoraAPIClient, AgoraResponse
 from .agora_rtm import AgoraRTMSignaling
@@ -125,6 +126,9 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._agora_response: AgoraResponse | None = None
         self._ice_servers: list[RTCIceServer] = []
         self._remove_ice_servers: Callable[[], None] | None = None
+        self._mirror_browser_sessions: set[str] = set()
+        self._pending_mirror_browser_sessions: set[str] = set()
+        self._pending_mirror_browser_candidates: dict[str, list[RTCIceCandidateInit]] = {}
 
     @property
     def available(self) -> bool:
@@ -133,10 +137,17 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose WHEP URL for go2rtc / external WebRTC consumers."""
+        """Expose mirror WHEP URL for go2rtc / external WebRTC consumers."""
+        mirror_path = f"/api/petkit/whep_mirror/{self.device.id}"
+        try:
+            base_url = get_url(self.hass, prefer_external=False)
+        except NoURLAvailableError:
+            mirror_url = mirror_path
+        else:
+            mirror_url = f"{base_url.rstrip('/')}{mirror_path}"
+
         return {
-            "whep_url": f"/api/petkit/whep/{self.device.id}",
-            "whep_mirror_url": f"/api/petkit/whep_mirror/{self.device.id}",
+            "whep_mirror_url": mirror_url,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -179,48 +190,40 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         offer_sdp: str,
         session_id: str,
         send_message: WebRTCSendMessage,
-        *,
-        defer_media_start: bool = False,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
-        device_id = str(self.device.id)
-
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
         if AIORTC_IMPORT_ERROR is None:
             manager = _get_manager(self.hass)
-            try:
-                LOGGER.debug(
-                    "WebRTC browser offer for %s using mirror relay path",
-                    device_id,
-                )
-                _, answer_sdp = await manager.create_downstream_offer(
-                    self,
-                    offer_sdp,
-                    session_id=session_id,
-                    kind="browser",
-                )
-                send_message(WebRTCAnswer(answer_sdp))
-                return
-            except asyncio.TimeoutError:
-                LOGGER.warning(
-                    "Mirror relay path timed out for %s, falling back to direct browser path",
-                    device_id,
-                )
-            except (OSError, RuntimeError, ValueError) as err:
-                LOGGER.warning(
-                    "Mirror relay path failed for %s, falling back to direct browser path: %s",
-                    device_id,
-                    err,
-                )
+            if await manager.has_upstream(str(self.device.id)):
+                self._pending_mirror_browser_sessions.add(session_id)
+                try:
+                    _, answer_sdp = await manager.create_downstream_offer(
+                        self,
+                        offer_sdp,
+                        session_id=session_id,
+                        kind="browser",
+                    )
+                    await self._flush_pending_mirror_candidates(manager, session_id)
+                except (OSError, RuntimeError, ValueError) as err:
+                    self._pending_mirror_browser_sessions.discard(session_id)
+                    self._pending_mirror_browser_candidates.pop(session_id, None)
+                    LOGGER.warning(
+                        "Mirror browser reuse failed for %s, falling back to direct path: %s",
+                        self.device.id,
+                        err,
+                    )
+                else:
+                    self._mirror_browser_sessions.add(session_id)
+                    self._pending_mirror_browser_sessions.discard(session_id)
+                    send_message(WebRTCAnswer(answer_sdp))
+                    return
 
         await self._agora_handler.disconnect()
-        self._agora_handler.configure_media_start(
-            defer_media_start=defer_media_start
-        )
         self._agora_handler.candidates = []
 
-        # Extract inline ICE candidates from SDP (for WHEP/go2rtc clients)
+        # Extract inline ICE candidates from SDP.
         for line in offer_sdp.splitlines():
             stripped = line.strip()
             if stripped.startswith("a=candidate:"):
@@ -280,7 +283,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 )
             )
         except (OSError, ValueError, RuntimeError) as err:
-            await self._async_close_stream()
+            await self._async_close_direct_stream()
             LOGGER.error("WebRTC offer handling failed: %s", err)
             send_message(
                 WebRTCError(
@@ -288,10 +291,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                     message=str(err),
                 )
             )
-
-    def schedule_deferred_media_start(self, delay: float) -> None:
-        """Start deferred media flow for WHEP-style mirror sessions."""
-        self.hass.async_create_task(self._agora_handler.activate_media_start(delay))
 
     async def async_on_webrtc_candidate(
         self,
@@ -301,37 +300,45 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         """Collect browser ICE candidates for join_v3."""
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
-        if AIORTC_IMPORT_ERROR is None:
-            manager = _get_manager(self.hass)
-            if await manager.add_downstream_candidate(
-                str(self.device.id),
-                session_id,
-                candidate,
-            ):
-                return
+        if session_id in self._mirror_browser_sessions:
+            if AIORTC_IMPORT_ERROR is None:
+                added = await _get_manager(self.hass).add_downstream_candidate(
+                    str(self.device.id),
+                    session_id,
+                    candidate,
+                )
+                if added:
+                    return
+            self._mirror_browser_sessions.discard(session_id)
+
+        if session_id in self._pending_mirror_browser_sessions:
+            self._pending_mirror_browser_candidates.setdefault(session_id, []).append(
+                candidate
+            )
+            return
 
         self._agora_handler.add_ice_candidate(candidate)
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
-        """Close and cleanup a WebRTC session."""
-        async def _close_session() -> None:
-            from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
-
-            if AIORTC_IMPORT_ERROR is None:
-                manager = _get_manager(self.hass)
-                if await manager.close_downstream(str(self.device.id), session_id):
-                    return
-            await self._async_close_stream()
-
-        self.hass.async_create_task(_close_session())
+        """Close and cleanup a direct browser WebRTC session."""
+        if (
+            session_id in self._mirror_browser_sessions
+            or session_id in self._pending_mirror_browser_sessions
+        ):
+            self.hass.async_create_task(self._async_close_mirror_browser_session(session_id))
+            return
+        self.hass.async_create_task(self._async_close_direct_stream())
 
     def get_ice_servers(self) -> list[RTCIceServer]:
         """Return cached Agora ICE servers for Home Assistant frontend."""
         return self._ice_servers
 
-    async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
-        """Stop signaling control (mode-dependent) and close websocket session."""
+    async def _async_close_direct_stream(
+        self,
+        send_stop_override: bool | None = None,
+    ) -> None:
+        """Stop the direct browser signaling path."""
         send_stop = (
             send_stop_override
             if send_stop_override is not None
@@ -350,6 +357,57 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                     result,
                 )
 
+    async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
+        """Stop direct browser state and any active mirror relay session."""
+        self._mirror_browser_sessions.clear()
+        self._pending_mirror_browser_sessions.clear()
+        self._pending_mirror_browser_candidates.clear()
+        await self._async_close_direct_stream(send_stop_override)
+
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is not None:
+            return
+
+        try:
+            await _get_manager(self.hass).close_device(str(self.device.id))
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "Mirror cleanup error for %s: %s",
+                self.device.id,
+                err,
+            )
+
+    async def _async_close_mirror_browser_session(self, session_id: str) -> None:
+        """Close one browser session backed by the mirror relay."""
+        self._mirror_browser_sessions.discard(session_id)
+        self._pending_mirror_browser_sessions.discard(session_id)
+        self._pending_mirror_browser_candidates.pop(session_id, None)
+
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is not None:
+            return
+
+        try:
+            await _get_manager(self.hass).close_downstream(str(self.device.id), session_id)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "Mirror browser session cleanup error for %s: %s",
+                self.device.id,
+                err,
+            )
+
+    async def _flush_pending_mirror_candidates(self, manager, session_id: str) -> None:
+        """Deliver trickled browser ICE candidates collected before relay setup."""
+        pending_candidates = self._pending_mirror_browser_candidates.pop(session_id, [])
+        for candidate in pending_candidates:
+            await manager.add_downstream_candidate(
+                str(self.device.id),
+                session_id,
+                candidate,
+            )
+
     async def async_ptz_ctrl(self, ptz_type: int, ptz_dir: int) -> bool:
         """Send a PTZ control command via RTM signaling.
 
@@ -357,10 +415,22 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         ptz_type: 0 = single step, 1 = continuous start/stop, 2 = flip.
         ptz_dir:  -1 = left, 0 = stop, 1 = right.
         """
-        return await self._agora_rtm.send_ptz_ctrl(ptz_type, ptz_dir)
+        rtm = await self._get_active_rtm()
+        return await rtm.send_ptz_ctrl(ptz_type, ptz_dir)
 
     async def async_start_live_manual(self) -> bool:
         """Start RTM live signaling manually from HA controls."""
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None and await _get_manager(self.hass).has_upstream(
+            str(self.device.id)
+        ):
+            LOGGER.debug(
+                "Manual start_live skipped for %s: mirror already active",
+                self.device.id,
+            )
+            return True
+
         live_feed = await self._async_get_live_feed(refresh=True)
         if live_feed is None:
             LOGGER.warning(
@@ -404,7 +474,22 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             return None
 
         await self._agora_rtm.update_tokens(live_feed)
+        active_rtm = await self._get_active_rtm()
+        if active_rtm is not self._agora_rtm:
+            await active_rtm.update_tokens(live_feed)
         return live_feed.rtc_token
+
+    async def _get_active_rtm(self) -> AgoraRTMSignaling:
+        """Return the RTM controller for the active stream when available."""
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None:
+            active_rtm = await _get_manager(self.hass).get_upstream_rtm(
+                str(self.device.id)
+            )
+            if active_rtm is not None:
+                return active_rtm
+        return self._agora_rtm
 
     async def _async_get_live_feed(self, refresh: bool = False) -> LiveFeed | None:
         """Return current live feed token payload for this device."""

@@ -136,6 +136,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         """Expose WHEP URL for go2rtc / external WebRTC consumers."""
         return {
             "whep_url": f"/api/petkit/whep/{self.device.id}",
+            "whep_mirror_url": f"/api/petkit/whep_mirror/{self.device.id}",
         }
 
     async def async_added_to_hass(self) -> None:

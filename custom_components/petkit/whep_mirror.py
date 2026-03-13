@@ -1,29 +1,430 @@
-"""Mirror WHEP endpoint using the camera entity's browser WebRTC path."""
+"""Mirror WHEP endpoint using an internal aiortc relay."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
 import secrets
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from homeassistant.components.camera import WebRTCAnswer, WebRTCError
 from homeassistant.components.http import HomeAssistantView
 
-from .const import DOMAIN, LOGGER
+from .agora_api import SERVICE_IDS, AgoraAPIClient
+from .agora_rtm import AgoraRTMSignaling
+from .agora_websocket import AgoraWebSocketHandler
+from .const import AGORA_APP_ID, DOMAIN, LOGGER
+from .whep import (
+    _add_offer_candidates,
+    _get_live_feed_for_whep,
+    _resolve_agora_user_id,
+)
+
+try:
+    from aiortc import (
+        RTCConfiguration,
+        RTCIceServer as AiortcIceServer,
+        RTCPeerConnection,
+        RTCRtpSender,
+        RTCSessionDescription,
+    )
+    from aiortc.contrib.media import MediaRelay
+except Exception as err:  # noqa: BLE001
+    RTCConfiguration = None
+    AiortcIceServer = None
+    RTCPeerConnection = None
+    RTCRtpSender = None
+    RTCSessionDescription = None
+    MediaRelay = None
+    AIORTC_IMPORT_ERROR = err
+else:
+    AIORTC_IMPORT_ERROR = None
+
+if TYPE_CHECKING:
+    from .camera import PetkitWebRTCCamera
+
+TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
+
+
+@dataclass
+class MirrorUpstreamSession:
+    """One internal WebRTC ingest from Agora."""
+
+    camera: PetkitWebRTCCamera
+    peer_connection: Any
+    agora_handler: AgoraWebSocketHandler
+    agora_rtm: AgoraRTMSignaling
+    relay: Any
+    video_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    video_track: Any | None = None
+    refresh_task: asyncio.Task[None] | None = None
+    last_error: str | None = None
+
+    @property
+    def device_id(self) -> str:
+        """Return device identifier."""
+        return str(self.camera.device.id)
+
+
+@dataclass
+class MirrorDownstreamSession:
+    """One downstream consumer served by the relay."""
+
+    session_id: str
+    peer_connection: Any
+
+
+class PetkitMirrorRelayManager:
+    """Manage internal upstream and downstream relay peers."""
+
+    def __init__(self, hass) -> None:
+        self.hass = hass
+        self._lock = asyncio.Lock()
+        self._upstreams: dict[str, MirrorUpstreamSession] = {}
+        self._downstreams: dict[str, MirrorDownstreamSession] = {}
+
+    async def create_downstream_offer(
+        self,
+        camera: PetkitWebRTCCamera,
+        offer_sdp: str,
+    ) -> tuple[str, str]:
+        """Create or reuse an upstream ingest, then answer one downstream offer."""
+        device_id = str(camera.device.id)
+        await self._close_downstream(device_id)
+        upstream = await self._ensure_upstream(camera)
+
+        peer_connection = RTCPeerConnection()
+        session_id = secrets.token_hex(16)
+        downstream = MirrorDownstreamSession(
+            session_id=session_id,
+            peer_connection=peer_connection,
+        )
+
+        @peer_connection.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            state = peer_connection.connectionState
+            LOGGER.debug(
+                "WHEP mirror downstream %s state=%s",
+                device_id,
+                state,
+            )
+            if state in {"failed", "closed"}:
+                self.hass.async_create_task(
+                    self._handle_downstream_closed(device_id, session_id)
+                )
+
+        sender = peer_connection.addTrack(upstream.relay.subscribe(upstream.video_track))
+        self._prefer_h264(peer_connection, sender)
+
+        await peer_connection.setRemoteDescription(
+            RTCSessionDescription(sdp=offer_sdp, type="offer")
+        )
+        answer = await peer_connection.createAnswer()
+        await peer_connection.setLocalDescription(answer)
+        await self._wait_for_ice_complete(peer_connection)
+
+        async with self._lock:
+            self._downstreams[device_id] = downstream
+
+        return session_id, str(peer_connection.localDescription.sdp)
+
+    async def close_device(self, device_id: str) -> bool:
+        """Close downstream and upstream relay state for one camera."""
+        downstream = None
+        upstream = None
+        async with self._lock:
+            downstream = self._downstreams.pop(device_id, None)
+            upstream = self._upstreams.pop(device_id, None)
+
+        if downstream is None and upstream is None:
+            return False
+
+        if downstream is not None:
+            await self._shutdown_peer(downstream.peer_connection)
+
+        if upstream is not None:
+            if upstream.refresh_task is not None:
+                upstream.refresh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await upstream.refresh_task
+            await asyncio.gather(
+                upstream.agora_handler.disconnect(),
+                upstream.agora_rtm.stop_live(send_stop=True),
+                self._shutdown_peer(upstream.peer_connection),
+                return_exceptions=True,
+            )
+
+        return True
+
+    async def close_all(self) -> None:
+        """Close all relay sessions."""
+        async with self._lock:
+            device_ids = set(self._upstreams) | set(self._downstreams)
+        for device_id in device_ids:
+            await self.close_device(device_id)
+
+    async def _ensure_upstream(
+        self,
+        camera: PetkitWebRTCCamera,
+    ) -> MirrorUpstreamSession:
+        """Ensure an internal ingest peer is running."""
+        device_id = str(camera.device.id)
+        async with self._lock:
+            existing = self._upstreams.get(device_id)
+
+        if (
+            existing is not None
+            and existing.video_ready.is_set()
+            and existing.peer_connection.connectionState not in {"failed", "closed"}
+        ):
+            return existing
+
+        if existing is not None:
+            await self.close_device(device_id)
+
+        live_feed = await _get_live_feed_for_whep(camera)
+        if live_feed is None:
+            raise RuntimeError("Live feed unavailable or missing RTM credentials")
+
+        agora_user_id = _resolve_agora_user_id(camera, live_feed)
+        async with AgoraAPIClient() as agora_client:
+            agora_response = await agora_client.choose_server(
+                app_id=AGORA_APP_ID,
+                token=live_feed.rtc_token,
+                channel_name=live_feed.channel_id,
+                user_id=agora_user_id,
+                service_flags=[
+                    SERVICE_IDS["CHOOSE_SERVER"],
+                    SERVICE_IDS["CLOUD_PROXY_FALLBACK"],
+                ],
+            )
+
+        ice_servers = []
+        for server in agora_response.get_ice_servers(use_all_turn_servers=False):
+            ice_servers.append(
+                AiortcIceServer(
+                    urls=server.urls,
+                    username=server.username,
+                    credential=server.credential,
+                )
+            )
+
+        peer_connection = RTCPeerConnection(
+            RTCConfiguration(iceServers=ice_servers)
+        )
+        relay = MediaRelay()
+        upstream = MirrorUpstreamSession(
+            camera=camera,
+            peer_connection=peer_connection,
+            agora_handler=AgoraWebSocketHandler(
+                rtc_token_provider=camera._refresh_rtc_token,
+                prefer_instant_video=True,
+                subscribe_retry_delay=1.0,
+                subscribe_retry_attempts=3,
+            ),
+            agora_rtm=AgoraRTMSignaling(AGORA_APP_ID),
+            relay=relay,
+        )
+
+        @peer_connection.on("track")
+        def on_track(track: Any) -> None:
+            LOGGER.debug(
+                "WHEP mirror upstream %s track kind=%s",
+                device_id,
+                track.kind,
+            )
+            if track.kind == "video" and upstream.video_track is None:
+                upstream.video_track = track
+                upstream.video_ready.set()
+
+            @track.on("ended")
+            async def on_ended() -> None:
+                LOGGER.debug(
+                    "WHEP mirror upstream %s track ended kind=%s",
+                    device_id,
+                    track.kind,
+                )
+                self.hass.async_create_task(self.close_device(device_id))
+
+        @peer_connection.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            state = peer_connection.connectionState
+            LOGGER.debug("WHEP mirror upstream %s state=%s", device_id, state)
+            if state in {"failed", "closed"}:
+                upstream.last_error = f"upstream connection state={state}"
+                self.hass.async_create_task(self.close_device(device_id))
+
+        transceiver = peer_connection.addTransceiver("video", direction="recvonly")
+        self._prefer_h264_transceiver(transceiver)
+
+        offer = await peer_connection.createOffer()
+        await peer_connection.setLocalDescription(offer)
+        await self._wait_for_ice_complete(peer_connection)
+
+        parsed_candidates = _add_offer_candidates(
+            upstream.agora_handler,
+            str(peer_connection.localDescription.sdp),
+        )
+        upstream.agora_handler.candidates = camera._filter_candidates(
+            upstream.agora_handler.candidates,
+            agora_response,
+        )
+        LOGGER.debug(
+            "WHEP mirror upstream %s candidates=%d filtered=%d",
+            device_id,
+            parsed_candidates,
+            len(upstream.agora_handler.candidates),
+        )
+
+        rtm_started = await upstream.agora_rtm.start_live(live_feed)
+        if not rtm_started:
+            LOGGER.warning(
+                "WHEP mirror upstream %s RTM start_live not acknowledged",
+                device_id,
+            )
+
+        answer_sdp = await upstream.agora_handler.connect_and_join(
+            live_feed=live_feed,
+            offer_sdp=str(peer_connection.localDescription.sdp),
+            session_id=secrets.token_hex(16),
+            app_id=AGORA_APP_ID,
+            agora_response=agora_response,
+        )
+        if not answer_sdp:
+            await asyncio.gather(
+                upstream.agora_handler.disconnect(),
+                upstream.agora_rtm.stop_live(send_stop=True),
+                self._shutdown_peer(peer_connection),
+                return_exceptions=True,
+            )
+            raise RuntimeError("Agora upstream negotiation failed")
+
+        await peer_connection.setRemoteDescription(
+            RTCSessionDescription(sdp=answer_sdp, type="answer")
+        )
+        await asyncio.wait_for(upstream.video_ready.wait(), timeout=20)
+        upstream.refresh_task = self.hass.async_create_task(
+            self._refresh_tokens(upstream)
+        )
+
+        async with self._lock:
+            self._upstreams[device_id] = upstream
+
+        return upstream
+
+    async def _refresh_tokens(self, upstream: MirrorUpstreamSession) -> None:
+        """Refresh RTM tokens while the upstream session is alive."""
+        try:
+            while True:
+                await asyncio.sleep(TOKEN_REFRESH_INTERVAL_SECONDS)
+                live_feed = await _get_live_feed_for_whep(upstream.camera)
+                if live_feed is None:
+                    continue
+                await upstream.agora_rtm.update_tokens(live_feed)
+        except asyncio.CancelledError:
+            return
+
+    async def _close_downstream(self, device_id: str) -> None:
+        """Close the current downstream consumer only."""
+        async with self._lock:
+            downstream = self._downstreams.pop(device_id, None)
+        if downstream is not None:
+            await self._shutdown_peer(downstream.peer_connection)
+
+    async def _handle_downstream_closed(
+        self,
+        device_id: str,
+        session_id: str,
+    ) -> None:
+        """Cleanup after downstream closure."""
+        async with self._lock:
+            downstream = self._downstreams.get(device_id)
+            if downstream is None or downstream.session_id != session_id:
+                return
+        await self.close_device(device_id)
+
+    @staticmethod
+    async def _shutdown_peer(peer_connection: Any) -> None:
+        """Close one aiortc peer connection."""
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            await peer_connection.close()
+
+    @staticmethod
+    async def _wait_for_ice_complete(peer_connection: Any) -> None:
+        """Wait briefly for ICE gathering to finish."""
+        if peer_connection.iceGatheringState == "complete":
+            return
+
+        ice_complete = asyncio.Event()
+
+        @peer_connection.on("icegatheringstatechange")
+        async def on_icegatheringstatechange() -> None:
+            if peer_connection.iceGatheringState == "complete":
+                ice_complete.set()
+
+        await asyncio.wait_for(ice_complete.wait(), timeout=5)
+
+    @staticmethod
+    def _prefer_h264(peer_connection: Any, sender: Any) -> None:
+        """Prefer H264 for downstream consumers when available."""
+        try:
+            transceiver = next(
+                transceiver
+                for transceiver in peer_connection.getTransceivers()
+                if transceiver.sender == sender
+            )
+        except StopIteration:
+            return
+
+        PetkitMirrorRelayManager._prefer_h264_transceiver(transceiver)
+
+    @staticmethod
+    def _prefer_h264_transceiver(transceiver: Any) -> None:
+        """Restrict codec preferences to H264 when supported."""
+        if RTCRtpSender is None:
+            return
+        try:
+            h264_codecs = [
+                codec
+                for codec in RTCRtpSender.getCapabilities("video").codecs
+                if codec.mimeType == "video/H264"
+            ]
+            if h264_codecs:
+                transceiver.setCodecPreferences(h264_codecs)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("Failed to set H264 codec preference: %s", err)
+
+
+def _get_manager(hass) -> PetkitMirrorRelayManager:
+    """Return the shared mirror relay manager."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    manager = domain_data.get("whep_mirror_manager")
+    if manager is None:
+        manager = PetkitMirrorRelayManager(hass)
+        domain_data["whep_mirror_manager"] = manager
+    return manager
+
+
+async def async_cleanup_whep_mirror_sessions(hass) -> None:
+    """Close all active mirror relay sessions."""
+    manager = hass.data.get(DOMAIN, {}).pop("whep_mirror_manager", None)
+    if manager is not None:
+        await manager.close_all()
 
 
 class PetkitWhepMirrorView(HomeAssistantView):
-    """WHEP endpoint that delegates to camera entity's async_handle_async_webrtc_offer."""
+    """WHEP endpoint that relays one internal aiortc ingest."""
 
     url = "/api/petkit/whep_mirror/{device_id}"
     name = "api:petkit:whep_mirror"
     requires_auth = False
 
     async def post(self, request: web.Request, device_id: str) -> web.Response:
-        """Receive SDP offer, delegate to camera entity, return SDP answer."""
+        """Receive SDP offer, relay via an internal aiortc peer, return answer."""
         hass = request.app["hass"]
 
-        # Auth: Bearer header or ?token= query param
         if not request.get("hass_user"):
             token = request.query.get("token")
             if token:
@@ -41,47 +442,34 @@ class PetkitWhepMirrorView(HomeAssistantView):
         if not offer_sdp or not offer_sdp.strip():
             return web.Response(status=400, text="Empty SDP offer")
 
-        session_id = secrets.token_hex(16)
-
-        # Delegate to the camera entity's browser WebRTC handler, but defer the
-        # media start until after the HTTP answer is written back to the client.
-        result = {}
-
-        def send_message(msg):
-            if isinstance(msg, WebRTCAnswer):
-                result["answer"] = msg.answer
-            elif isinstance(msg, WebRTCError):
-                result["error"] = msg.message
-
-        await camera.async_handle_async_webrtc_offer(
-            offer_sdp,
-            session_id,
-            send_message,
-            defer_media_start=True,
-        )
-
-        # Track session for DELETE cleanup
-        mirror_sessions = hass.data.setdefault(DOMAIN, {}).setdefault(
-            "mirror_sessions", {}
-        )
-        mirror_sessions[device_id] = {"session_id": session_id, "camera": camera}
-
-        if "answer" in result:
-            response = web.StreamResponse(
-                status=201,
-                headers={
-                    "Content-Type": "application/sdp",
-                    "Location": f"/api/petkit/whep_mirror/{device_id}",
-                },
+        if AIORTC_IMPORT_ERROR is not None:
+            return web.Response(
+                status=503,
+                text=f"aiortc relay unavailable: {AIORTC_IMPORT_ERROR}",
             )
-            await response.prepare(request)
-            await response.write(result["answer"].encode())
-            await response.write_eof()
 
-            camera.schedule_deferred_media_start(delay=1.0)
-            return response
+        manager = _get_manager(hass)
 
-        return web.Response(status=502, text=result.get("error", "Negotiation failed"))
+        try:
+            _, answer_sdp = await manager.create_downstream_offer(camera, offer_sdp)
+        except asyncio.TimeoutError:
+            LOGGER.error("WHEP mirror timed out for %s", device_id)
+            return web.Response(status=504, text="Timed out waiting for upstream video")
+        except (OSError, RuntimeError, ValueError) as err:
+            LOGGER.error("WHEP mirror failed for %s: %s", device_id, err)
+            return web.Response(status=502, text=str(err))
+
+        response = web.StreamResponse(
+            status=201,
+            headers={
+                "Content-Type": "application/sdp",
+                "Location": f"/api/petkit/whep_mirror/{device_id}",
+            },
+        )
+        await response.prepare(request)
+        await response.write(answer_sdp.encode())
+        await response.write_eof()
+        return response
 
     async def delete(self, request: web.Request, device_id: str) -> web.Response:
         """Tear down an active mirror session."""
@@ -95,10 +483,8 @@ class PetkitWhepMirrorView(HomeAssistantView):
             else:
                 return web.Response(status=401, text="Authentication required")
 
-        mirror_sessions = hass.data.get(DOMAIN, {}).get("mirror_sessions", {})
-        session = mirror_sessions.pop(device_id, None)
-        if session is None:
+        manager = _get_manager(hass)
+        if not await manager.close_device(device_id):
             return web.Response(status=404, text="No active mirror session")
 
-        session["camera"].close_webrtc_session(session["session_id"])
         return web.Response(status=200, text="Session closed")

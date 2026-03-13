@@ -40,7 +40,10 @@ from .coordinator import (
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
 from .whep import PetkitWhepView, async_cleanup_whep_sessions
-from .whep_mirror import PetkitWhepMirrorView
+from .whep_mirror import (
+    PetkitWhepMirrorView,
+    async_cleanup_whep_mirror_sessions,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -200,6 +203,7 @@ async def async_unload_entry(
         await mqtt_listener.async_stop()
 
     await async_cleanup_whep_sessions(hass)
+    await async_cleanup_whep_mirror_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 

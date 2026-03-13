@@ -183,6 +183,14 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         await self._agora_handler.disconnect()
         self._agora_handler.candidates = []
 
+        # Extract inline ICE candidates from SDP (for WHEP/go2rtc clients)
+        for line in offer_sdp.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("a=candidate:"):
+                self._agora_handler.add_ice_candidate(
+                    RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
+                )
+
         try:
             live_feed = await self._async_get_live_feed(refresh=True)
             if live_feed is None:

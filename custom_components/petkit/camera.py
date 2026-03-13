@@ -160,6 +160,11 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.get_ice_servers,
         )
 
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None:
+            _get_manager(self.hass).register_persistent_camera(self)
+
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
         if self._remove_ice_servers:
@@ -167,6 +172,12 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self._remove_ice_servers = None
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
+
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None:
+            _get_manager(self.hass).unregister_persistent_camera(str(self.device.id))
+
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -196,29 +207,28 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
         if AIORTC_IMPORT_ERROR is None:
             manager = _get_manager(self.hass)
-            if await manager.has_upstream(str(self.device.id)):
-                self._pending_mirror_browser_sessions.add(session_id)
-                try:
-                    _, answer_sdp = await manager.create_downstream_offer(
-                        self,
-                        offer_sdp,
-                        session_id=session_id,
-                        kind="browser",
-                    )
-                    await self._flush_pending_mirror_candidates(manager, session_id)
-                except (OSError, RuntimeError, ValueError) as err:
-                    self._pending_mirror_browser_sessions.discard(session_id)
-                    self._pending_mirror_browser_candidates.pop(session_id, None)
-                    LOGGER.warning(
-                        "Mirror browser reuse failed for %s, falling back to direct path: %s",
-                        self.device.id,
-                        err,
-                    )
-                else:
-                    self._mirror_browser_sessions.add(session_id)
-                    self._pending_mirror_browser_sessions.discard(session_id)
-                    send_message(WebRTCAnswer(answer_sdp))
-                    return
+            self._pending_mirror_browser_sessions.add(session_id)
+            try:
+                _, answer_sdp = await manager.create_downstream_offer(
+                    self,
+                    offer_sdp,
+                    session_id=session_id,
+                    kind="browser",
+                )
+                await self._flush_pending_mirror_candidates(manager, session_id)
+            except (OSError, RuntimeError, ValueError) as err:
+                self._pending_mirror_browser_sessions.discard(session_id)
+                self._pending_mirror_browser_candidates.pop(session_id, None)
+                LOGGER.warning(
+                    "Mirror browser startup failed for %s, falling back to direct path: %s",
+                    self.device.id,
+                    err,
+                )
+            else:
+                self._mirror_browser_sessions.add(session_id)
+                self._pending_mirror_browser_sessions.discard(session_id)
+                send_message(WebRTCAnswer(answer_sdp))
+                return
 
         await self._agora_handler.disconnect()
         self._agora_handler.candidates = []
@@ -370,7 +380,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             return
 
         try:
-            await _get_manager(self.hass).close_device(str(self.device.id))
+            await _get_manager(self.hass).close_device(
+                str(self.device.id),
+                allow_restart=False,
+            )
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
                 "Mirror cleanup error for %s: %s",

@@ -69,6 +69,14 @@ class MirrorUpstreamSession:
         """Return device identifier."""
         return str(self.camera.device.id)
 
+    @property
+    def is_alive(self) -> bool:
+        """Return whether the upstream session is ready and connected."""
+        return (
+            self.video_ready.is_set()
+            and self.peer_connection.connectionState not in {"failed", "closed"}
+        )
+
 
 @dataclass
 class MirrorDownstreamSession:
@@ -86,7 +94,23 @@ class PetkitMirrorRelayManager:
         self.hass = hass
         self._lock = asyncio.Lock()
         self._upstreams: dict[str, MirrorUpstreamSession] = {}
+        self._upstream_tasks: dict[str, asyncio.Task[MirrorUpstreamSession]] = {}
         self._downstreams: dict[str, dict[str, MirrorDownstreamSession]] = {}
+        self._persistent_cameras: dict[str, PetkitWebRTCCamera] = {}
+        self._prewarm_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def register_persistent_camera(self, camera: PetkitWebRTCCamera) -> None:
+        """Keep one upstream relay alive for this camera."""
+        device_id = str(camera.device.id)
+        self._persistent_cameras[device_id] = camera
+        self._schedule_prewarm(device_id)
+
+    def unregister_persistent_camera(self, device_id: str) -> None:
+        """Stop maintaining a hot upstream relay for this camera."""
+        self._persistent_cameras.pop(device_id, None)
+        task = self._prewarm_tasks.pop(device_id, None)
+        if task is not None:
+            task.cancel()
 
     async def create_downstream_offer(
         self,
@@ -141,40 +165,46 @@ class PetkitMirrorRelayManager:
 
         return session_id, str(peer_connection.localDescription.sdp)
 
-    async def close_device(self, device_id: str) -> bool:
+    async def close_device(self, device_id: str, *, allow_restart: bool = True) -> bool:
         """Close downstream and upstream relay state for one camera."""
         downstreams: list[MirrorDownstreamSession] = []
         upstream = None
+        ensure_task = None
         async with self._lock:
             downstreams = list(self._downstreams.pop(device_id, {}).values())
             upstream = self._upstreams.pop(device_id, None)
+            ensure_task = self._upstream_tasks.pop(device_id, None)
 
-        if not downstreams and upstream is None:
+        if ensure_task is not None and ensure_task is not asyncio.current_task():
+            ensure_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ensure_task
+
+        if not downstreams and upstream is None and ensure_task is None:
             return False
 
-        for downstream in downstreams:
-            await self._shutdown_peer(downstream.peer_connection)
-
-        if upstream is not None:
-            if upstream.refresh_task is not None:
-                upstream.refresh_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await upstream.refresh_task
+        if downstreams:
             await asyncio.gather(
-                upstream.agora_handler.disconnect(),
-                upstream.agora_rtm.stop_live(send_stop=True),
-                self._shutdown_peer(upstream.peer_connection),
+                *(self._shutdown_peer(d.peer_connection) for d in downstreams),
                 return_exceptions=True,
             )
+
+        if upstream is not None:
+            await self._shutdown_upstream(upstream)
+
+        if allow_restart:
+            self._schedule_prewarm(device_id)
 
         return True
 
     async def close_all(self) -> None:
         """Close all relay sessions."""
+        for device_id in list(self._persistent_cameras):
+            self.unregister_persistent_camera(device_id)
         async with self._lock:
             device_ids = set(self._upstreams) | set(self._downstreams)
         for device_id in device_ids:
-            await self.close_device(device_id)
+            await self.close_device(device_id, allow_restart=False)
 
     async def close_downstream(self, device_id: str, session_id: str) -> bool:
         """Close one downstream consumer and upstream if it was the last one."""
@@ -182,6 +212,7 @@ class PetkitMirrorRelayManager:
             sessions = self._downstreams.get(device_id)
             downstream = sessions.pop(session_id, None) if sessions else None
             has_remaining = bool(sessions)
+            keep_upstream_alive = device_id in self._persistent_cameras
             if sessions is not None and not sessions:
                 self._downstreams.pop(device_id, None)
 
@@ -189,7 +220,7 @@ class PetkitMirrorRelayManager:
             return False
 
         await self._shutdown_peer(downstream.peer_connection)
-        if not has_remaining:
+        if not has_remaining and not keep_upstream_alive:
             await self._close_upstream_if_unused(device_id)
         return True
 
@@ -241,21 +272,13 @@ class PetkitMirrorRelayManager:
         """Return whether an active relay upstream already exists."""
         async with self._lock:
             upstream = self._upstreams.get(device_id)
-        return (
-            upstream is not None
-            and upstream.video_ready.is_set()
-            and upstream.peer_connection.connectionState not in {"failed", "closed"}
-        )
+        return upstream is not None and upstream.is_alive
 
     async def get_upstream_rtm(self, device_id: str) -> AgoraRTMSignaling | None:
         """Return the active upstream RTM session for one device."""
         async with self._lock:
             upstream = self._upstreams.get(device_id)
-        if (
-            upstream is None
-            or not upstream.video_ready.is_set()
-            or upstream.peer_connection.connectionState in {"failed", "closed"}
-        ):
+        if upstream is None or not upstream.is_alive:
             return None
         return upstream.agora_rtm
 
@@ -267,16 +290,42 @@ class PetkitMirrorRelayManager:
         device_id = str(camera.device.id)
         async with self._lock:
             existing = self._upstreams.get(device_id)
+            if existing is not None and existing.is_alive:
+                return existing
+            ensure_task = self._upstream_tasks.get(device_id)
+            if ensure_task is None:
+                ensure_task = self.hass.async_create_task(
+                    self._create_upstream(camera)
+                )
+                self._upstream_tasks[device_id] = ensure_task
 
-        if (
-            existing is not None
-            and existing.video_ready.is_set()
-            and existing.peer_connection.connectionState not in {"failed", "closed"}
-        ):
-            return existing
+        return await ensure_task
 
+    async def _create_upstream(
+        self,
+        camera: PetkitWebRTCCamera,
+    ) -> MirrorUpstreamSession:
+        """Create one internal ingest peer connected to Agora."""
+        device_id = str(camera.device.id)
+        async with self._lock:
+            existing = self._upstreams.get(device_id)
         if existing is not None:
-            await self.close_device(device_id)
+            await self.close_device(device_id, allow_restart=False)
+
+        try:
+            return await self._build_upstream(camera)
+        finally:
+            async with self._lock:
+                current_task = self._upstream_tasks.get(device_id)
+                if current_task is asyncio.current_task():
+                    self._upstream_tasks.pop(device_id, None)
+
+    async def _build_upstream(
+        self,
+        camera: PetkitWebRTCCamera,
+    ) -> MirrorUpstreamSession:
+        """Negotiate the upstream aiortc ingest peer against Agora."""
+        device_id = str(camera.device.id)
 
         live_feed = await _get_live_feed_for_webrtc(camera)
         if live_feed is None:
@@ -438,6 +487,48 @@ class PetkitMirrorRelayManager:
         if upstream is None:
             return
 
+        await self._shutdown_upstream(upstream)
+
+    def _schedule_prewarm(self, device_id: str, delay: float = 0) -> None:
+        """Start or restart background upstream prewarm for a persistent camera."""
+        if device_id not in self._persistent_cameras:
+            return
+
+        task = self._prewarm_tasks.get(device_id)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            return
+
+        prewarm_task = self.hass.async_create_task(
+            self._prewarm_upstream(device_id, delay)
+        )
+        self._prewarm_tasks[device_id] = prewarm_task
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            if self._prewarm_tasks.get(device_id) is done_task:
+                self._prewarm_tasks.pop(device_id, None)
+
+        prewarm_task.add_done_callback(_cleanup)
+
+    async def _prewarm_upstream(self, device_id: str, delay: float) -> None:
+        """Warm the upstream relay in the background."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        camera = self._persistent_cameras.get(device_id)
+        if camera is None:
+            return
+
+        try:
+            await self._ensure_upstream(camera)
+            LOGGER.debug("WHEP mirror prewarmed for %s", device_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("WHEP mirror prewarm failed for %s: %s", device_id, err)
+            self._schedule_prewarm(device_id, delay=15)
+
+    async def _shutdown_upstream(self, upstream: MirrorUpstreamSession) -> None:
+        """Cancel refresh task and tear down one upstream session."""
         if upstream.refresh_task is not None:
             upstream.refresh_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -39,6 +39,7 @@ from .coordinator import (
 )
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
+from .whep import PetkitWhepView, async_cleanup_whep_sessions
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -113,6 +114,7 @@ async def async_setup_entry(
 
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitSessionView())
+    hass.http.register_view(PetkitWhepView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone
@@ -194,6 +196,8 @@ async def async_unload_entry(
     mqtt_listener = getattr(entry.runtime_data, "mqtt_listener", None)
     if mqtt_listener is not None:
         await mqtt_listener.async_stop()
+
+    await async_cleanup_whep_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 

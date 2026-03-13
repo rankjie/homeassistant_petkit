@@ -131,6 +131,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         """Return if entity is available."""
         return super().available and self.device.id in self.coordinator.data
 
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        """Expose WHEP URL for go2rtc / external WebRTC consumers."""
+        return {
+            "whep_url": f"/api/petkit/whep/{self.device.id}",
+        }
+
     async def async_added_to_hass(self) -> None:
         """Register ICE callback when entity is added."""
         await super().async_added_to_hass()

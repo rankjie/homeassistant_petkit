@@ -677,7 +677,7 @@ class AgoraWebSocketHandler:
                 "process_id": process_id,
                 "mode": "live",
                 "codec": "h264",
-                "role": "host",
+                "role": "audience" if self._defer_media_start else "host",
                 "has_changed_gateway": False,
                 "ap_response": agora_response.to_ap_response(
                     RESPONSE_FLAGS["CHOOSE_SERVER"]
@@ -693,7 +693,9 @@ class AgoraWebSocketHandler:
                         "maxSubscription": 50,
                         "enableUserLicenseCheck": True,
                         "enableRTX": True,
-                        "enableInstantVideo": self._prefer_instant_video,
+                        "enableInstantVideo": (
+                            self._prefer_instant_video and not self._defer_media_start
+                        ),
                         "enableDataStream2": False,
                         "enableAutFeedback": True,
                         "enableUserAutoRebalanceCheck": True,

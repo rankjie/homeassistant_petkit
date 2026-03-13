@@ -183,6 +183,37 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         defer_media_start: bool = False,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
+        device_id = str(self.device.id)
+
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None:
+            manager = _get_manager(self.hass)
+            try:
+                LOGGER.debug(
+                    "WebRTC browser offer for %s using mirror relay path",
+                    device_id,
+                )
+                _, answer_sdp = await manager.create_downstream_offer(
+                    self,
+                    offer_sdp,
+                    session_id=session_id,
+                    kind="browser",
+                )
+                send_message(WebRTCAnswer(answer_sdp))
+                return
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Mirror relay path timed out for %s, falling back to direct browser path",
+                    device_id,
+                )
+            except (OSError, RuntimeError, ValueError) as err:
+                LOGGER.warning(
+                    "Mirror relay path failed for %s, falling back to direct browser path: %s",
+                    device_id,
+                    err,
+                )
+
         await self._agora_handler.disconnect()
         self._agora_handler.configure_media_start(
             defer_media_start=defer_media_start
@@ -268,12 +299,32 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         candidate: RTCIceCandidateInit,
     ) -> None:
         """Collect browser ICE candidates for join_v3."""
+        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+        if AIORTC_IMPORT_ERROR is None:
+            manager = _get_manager(self.hass)
+            if await manager.add_downstream_candidate(
+                str(self.device.id),
+                session_id,
+                candidate,
+            ):
+                return
+
         self._agora_handler.add_ice_candidate(candidate)
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
         """Close and cleanup a WebRTC session."""
-        self.hass.async_create_task(self._async_close_stream())
+        async def _close_session() -> None:
+            from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
+
+            if AIORTC_IMPORT_ERROR is None:
+                manager = _get_manager(self.hass)
+                if await manager.close_downstream(str(self.device.id), session_id):
+                    return
+            await self._async_close_stream()
+
+        self.hass.async_create_task(_close_session())
 
     def get_ice_servers(self) -> list[RTCIceServer]:
         """Return cached Agora ICE servers for Home Assistant frontend."""

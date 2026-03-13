@@ -31,6 +31,7 @@ try:
         RTCSessionDescription,
     )
     from aiortc.contrib.media import MediaRelay
+    from aiortc.sdp import candidate_from_sdp
 except Exception as err:  # noqa: BLE001
     RTCConfiguration = None
     AiortcIceServer = None
@@ -38,6 +39,7 @@ except Exception as err:  # noqa: BLE001
     RTCRtpSender = None
     RTCSessionDescription = None
     MediaRelay = None
+    candidate_from_sdp = None
     AIORTC_IMPORT_ERROR = err
 else:
     AIORTC_IMPORT_ERROR = None
@@ -73,6 +75,7 @@ class MirrorDownstreamSession:
     """One downstream consumer served by the relay."""
 
     session_id: str
+    kind: str
     peer_connection: Any
 
 
@@ -83,22 +86,30 @@ class PetkitMirrorRelayManager:
         self.hass = hass
         self._lock = asyncio.Lock()
         self._upstreams: dict[str, MirrorUpstreamSession] = {}
-        self._downstreams: dict[str, MirrorDownstreamSession] = {}
+        self._downstreams: dict[str, dict[str, MirrorDownstreamSession]] = {}
 
     async def create_downstream_offer(
         self,
         camera: PetkitWebRTCCamera,
         offer_sdp: str,
+        *,
+        session_id: str | None = None,
+        kind: str = "whep",
     ) -> tuple[str, str]:
         """Create or reuse an upstream ingest, then answer one downstream offer."""
         device_id = str(camera.device.id)
-        await self._close_downstream(device_id)
+        if kind == "whep":
+            await self._close_downstreams_by_kind(device_id, kind)
+        elif session_id is not None:
+            await self.close_downstream(device_id, session_id)
         upstream = await self._ensure_upstream(camera)
 
         peer_connection = RTCPeerConnection()
-        session_id = secrets.token_hex(16)
+        if session_id is None:
+            session_id = secrets.token_hex(16)
         downstream = MirrorDownstreamSession(
             session_id=session_id,
+            kind=kind,
             peer_connection=peer_connection,
         )
 
@@ -126,22 +137,22 @@ class PetkitMirrorRelayManager:
         await self._wait_for_ice_complete(peer_connection)
 
         async with self._lock:
-            self._downstreams[device_id] = downstream
+            self._downstreams.setdefault(device_id, {})[session_id] = downstream
 
         return session_id, str(peer_connection.localDescription.sdp)
 
     async def close_device(self, device_id: str) -> bool:
         """Close downstream and upstream relay state for one camera."""
-        downstream = None
+        downstreams: list[MirrorDownstreamSession] = []
         upstream = None
         async with self._lock:
-            downstream = self._downstreams.pop(device_id, None)
+            downstreams = list(self._downstreams.pop(device_id, {}).values())
             upstream = self._upstreams.pop(device_id, None)
 
-        if downstream is None and upstream is None:
+        if not downstreams and upstream is None:
             return False
 
-        if downstream is not None:
+        for downstream in downstreams:
             await self._shutdown_peer(downstream.peer_connection)
 
         if upstream is not None:
@@ -164,6 +175,82 @@ class PetkitMirrorRelayManager:
             device_ids = set(self._upstreams) | set(self._downstreams)
         for device_id in device_ids:
             await self.close_device(device_id)
+
+    async def close_downstream(self, device_id: str, session_id: str) -> bool:
+        """Close one downstream consumer and upstream if it was the last one."""
+        async with self._lock:
+            sessions = self._downstreams.get(device_id)
+            downstream = sessions.pop(session_id, None) if sessions else None
+            has_remaining = bool(sessions)
+            if sessions is not None and not sessions:
+                self._downstreams.pop(device_id, None)
+
+        if downstream is None:
+            return False
+
+        await self._shutdown_peer(downstream.peer_connection)
+        if not has_remaining:
+            await self._close_upstream_if_unused(device_id)
+        return True
+
+    async def close_downstreams_by_kind(self, device_id: str, kind: str) -> bool:
+        """Close downstream sessions matching kind and upstream if none remain."""
+        async with self._lock:
+            sessions = self._downstreams.get(device_id, {})
+            matching_ids = [
+                session_id
+                for session_id, session in sessions.items()
+                if session.kind == kind
+            ]
+
+        closed_any = False
+        for session_id in matching_ids:
+            closed_any = await self.close_downstream(device_id, session_id) or closed_any
+        return closed_any
+
+    async def add_downstream_candidate(
+        self,
+        device_id: str,
+        session_id: str,
+        candidate,
+    ) -> bool:
+        """Add trickled ICE candidate to a relay downstream peer."""
+        if candidate_from_sdp is None:
+            return False
+
+        async with self._lock:
+            downstream = self._downstreams.get(device_id, {}).get(session_id)
+
+        if downstream is None:
+            return False
+
+        candidate_line = candidate.candidate or ""
+        if not candidate_line:
+            return True
+
+        if candidate_line.startswith("candidate:"):
+            candidate_line = candidate_line.removeprefix("candidate:")
+
+        ice_candidate = candidate_from_sdp(candidate_line)
+        ice_candidate.sdpMid = candidate.sdp_mid
+        ice_candidate.sdpMLineIndex = candidate.sdp_m_line_index
+        await downstream.peer_connection.addIceCandidate(ice_candidate)
+        return True
+
+    async def has_upstream(self, device_id: str) -> bool:
+        """Return whether an active relay upstream already exists."""
+        async with self._lock:
+            upstream = self._upstreams.get(device_id)
+        return (
+            upstream is not None
+            and upstream.video_ready.is_set()
+            and upstream.peer_connection.connectionState not in {"failed", "closed"}
+        )
+
+    async def has_downstream(self, device_id: str, session_id: str) -> bool:
+        """Return whether a relay downstream session exists."""
+        async with self._lock:
+            return session_id in self._downstreams.get(device_id, {})
 
     async def _ensure_upstream(
         self,
@@ -326,24 +413,35 @@ class PetkitMirrorRelayManager:
         except asyncio.CancelledError:
             return
 
-    async def _close_downstream(self, device_id: str) -> None:
-        """Close the current downstream consumer only."""
-        async with self._lock:
-            downstream = self._downstreams.pop(device_id, None)
-        if downstream is not None:
-            await self._shutdown_peer(downstream.peer_connection)
-
     async def _handle_downstream_closed(
         self,
         device_id: str,
         session_id: str,
     ) -> None:
         """Cleanup after downstream closure."""
+        await self.close_downstream(device_id, session_id)
+
+    async def _close_upstream_if_unused(self, device_id: str) -> None:
+        """Close upstream relay only when no downstream consumers remain."""
         async with self._lock:
-            downstream = self._downstreams.get(device_id)
-            if downstream is None or downstream.session_id != session_id:
+            if self._downstreams.get(device_id):
                 return
-        await self.close_device(device_id)
+            upstream = self._upstreams.pop(device_id, None)
+
+        if upstream is None:
+            return
+
+        if upstream.refresh_task is not None:
+            upstream.refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await upstream.refresh_task
+
+        await asyncio.gather(
+            upstream.agora_handler.disconnect(),
+            upstream.agora_rtm.stop_live(send_stop=True),
+            self._shutdown_peer(upstream.peer_connection),
+            return_exceptions=True,
+        )
 
     @staticmethod
     async def _shutdown_peer(peer_connection: Any) -> None:
@@ -451,7 +549,11 @@ class PetkitWhepMirrorView(HomeAssistantView):
         manager = _get_manager(hass)
 
         try:
-            _, answer_sdp = await manager.create_downstream_offer(camera, offer_sdp)
+            _, answer_sdp = await manager.create_downstream_offer(
+                camera,
+                offer_sdp,
+                kind="whep",
+            )
         except asyncio.TimeoutError:
             LOGGER.error("WHEP mirror timed out for %s", device_id)
             return web.Response(status=504, text="Timed out waiting for upstream video")
@@ -484,7 +586,7 @@ class PetkitWhepMirrorView(HomeAssistantView):
                 return web.Response(status=401, text="Authentication required")
 
         manager = _get_manager(hass)
-        if not await manager.close_device(device_id):
+        if not await manager.close_downstreams_by_kind(device_id, "whep"):
             return web.Response(status=404, text="No active mirror session")
 
         return web.Response(status=200, text="Session closed")

@@ -5,13 +5,10 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from pypetkitapi import PetKitClient
-
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_REGION,
     CONF_TIME_ZONE,
-    CONF_USERNAME,
     Platform,
 )
 from homeassistant.helpers import device_registry as dr
@@ -37,6 +34,10 @@ from .coordinator import (
 )
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
+from .whep_mirror import (
+    PetkitWhepMirrorView,
+    async_cleanup_whep_mirror_sessions,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -56,13 +57,14 @@ PLATFORMS: list[Platform] = [
     Platform.IMAGE,
     Platform.FAN,
 ]
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: PetkitConfigEntry,
 ) -> bool:
     """Set up this integration using UI."""
+
+    # Register API views once (idempotent — HA deduplicates by name)
+    hass.http.register_view(PetkitWhepMirrorView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone
@@ -144,6 +146,9 @@ async def async_unload_entry(
     mqtt_listener = getattr(entry.runtime_data, "mqtt_listener", None)
     if mqtt_listener is not None:
         await mqtt_listener.async_stop()
+
+    if len(hass.config_entries.async_entries(DOMAIN)) <= 1:
+        await async_cleanup_whep_mirror_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 

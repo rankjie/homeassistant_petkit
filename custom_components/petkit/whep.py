@@ -54,11 +54,21 @@ class PetkitWhepView(HomeAssistantView):
 
     url = "/api/petkit/whep/{device_id}"
     name = "api:petkit:whep"
-    requires_auth = True
+    requires_auth = False
 
     async def post(self, request: web.Request, device_id: str) -> web.Response:
         """Receive SDP offer, perform Agora signaling, return SDP answer."""
         hass = request.app["hass"]
+
+        # Auth: accept standard Bearer header OR ?token= query param
+        if not request.get("hass_user"):
+            token = request.query.get("token")
+            if token:
+                refresh_token = hass.auth.async_validate_access_token(token)
+                if refresh_token is None:
+                    return web.Response(status=401, text="Invalid token")
+            else:
+                return web.Response(status=401, text="Authentication required")
 
         cameras: dict[str, PetkitWebRTCCamera] = hass.data.get(DOMAIN, {}).get(
             "cameras", {}
@@ -138,6 +148,15 @@ class PetkitWhepView(HomeAssistantView):
     async def delete(self, request: web.Request, device_id: str) -> web.Response:
         """Tear down an active WHEP session."""
         hass = request.app["hass"]
+
+        if not request.get("hass_user"):
+            token = request.query.get("token")
+            if token:
+                refresh_token = hass.auth.async_validate_access_token(token)
+                if refresh_token is None:
+                    return web.Response(status=401, text="Invalid token")
+            else:
+                return web.Response(status=401, text="Authentication required")
 
         whep_sessions: dict[str, WhepSession] = hass.data.get(DOMAIN, {}).get(
             "whep_sessions", {}

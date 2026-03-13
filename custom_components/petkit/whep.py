@@ -188,14 +188,32 @@ class WhepSession:
         self.rtm = rtm
         self.handler = handler
         self.agora_response = agora_response
+        self._activation_task: asyncio.Task[None] | None = None
+
+    def schedule_media_start(self, delay: float) -> None:
+        """Start Agora media flow after the WHEP answer is delivered."""
+        if self._activation_task and not self._activation_task.done():
+            return
+        self._activation_task = asyncio.create_task(
+            self.handler.activate_media_start(delay=delay)
+        )
 
     async def close(self) -> None:
         """Tear down RTM + WebSocket."""
-        results = await asyncio.gather(
-            self.rtm.stop_live(send_stop=True),
-            self.handler.disconnect(),
-            return_exceptions=True,
+        tasks: list[asyncio.Future[None] | asyncio.Task[None] | asyncio.Future] = []
+        if self._activation_task and not self._activation_task.done():
+            self._activation_task.cancel()
+            tasks.append(self._activation_task)
+        self._activation_task = None
+
+        tasks.extend(
+            [
+                self.rtm.stop_live(send_stop=True),
+                self.handler.disconnect(),
+            ]
         )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
                 LOGGER.debug("WHEP session cleanup error: %s", result)
@@ -272,6 +290,7 @@ class PetkitWhepView(HomeAssistantView):
             handler = AgoraWebSocketHandler(
                 rtc_token_provider=camera._refresh_rtc_token,
                 prefer_instant_video=True,
+                defer_media_start=True,
                 subscribe_retry_delay=1.0,
                 subscribe_retry_attempts=3,
             )
@@ -326,19 +345,27 @@ class PetkitWhepView(HomeAssistantView):
                 )
                 return web.Response(status=502, text="Agora negotiation failed")
 
-            whep_sessions[device_id] = WhepSession(rtm, handler, agora_response)
+            session = WhepSession(rtm, handler, agora_response)
+            whep_sessions[device_id] = session
             LOGGER.debug(
                 "WHEP: negotiated device %s successfully (answer bytes=%d)",
                 device_id,
                 len(answer_sdp),
             )
 
-            return web.Response(
+            response = web.StreamResponse(
                 status=201,
-                body=answer_sdp,
-                content_type="application/sdp",
-                headers={"Location": f"/api/petkit/whep/{device_id}"},
+                headers={
+                    "Content-Type": "application/sdp",
+                    "Location": f"/api/petkit/whep/{device_id}",
+                },
             )
+            await response.prepare(request)
+            await response.write(answer_sdp.encode())
+            await response.write_eof()
+
+            session.schedule_media_start(delay=1.0)
+            return response
 
         except (OSError, ValueError, RuntimeError) as err:
             LOGGER.error("WHEP signaling failed for %s: %s", device_id, err)

@@ -122,6 +122,11 @@ class AgoraWebSocketHandler:
             ortc_info.setdefault("iceParameters", {})[
                 "candidates"
             ] = gathered_candidates
+        LOGGER.debug(
+            "Agora join_v3: session=%s gathered_candidates=%d",
+            session_id,
+            len(gathered_candidates),
+        )
 
         gateway_addresses = agora_response.get_gateway_addresses()
         if not gateway_addresses:
@@ -130,6 +135,10 @@ class AgoraWebSocketHandler:
             )
             gateway_addresses = agora_response.addresses
 
+        LOGGER.debug(
+            "Agora join_v3: trying %d gateway addresses",
+            len(gateway_addresses),
+        )
         for gateway in gateway_addresses:
             edge_ip_dashed = gateway.ip.replace(".", "-")
             ws_url = f"wss://{edge_ip_dashed}.edge.agora.io:{gateway.port}"
@@ -402,6 +411,12 @@ class AgoraWebSocketHandler:
         if not isinstance(uid, int) or not is_video:
             return
 
+        LOGGER.debug(
+            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s",
+            uid,
+            ssrc_id,
+            rtx_ssrc_id,
+        )
         self._video_streams[uid] = {
             "ssrcId": ssrc_id,
             "rtxSsrcId": rtx_ssrc_id,
@@ -445,6 +460,12 @@ class AgoraWebSocketHandler:
         if not self._websocket:
             return
 
+        LOGGER.debug(
+            "Agora subscribe: stream_id=%s ssrc_id=%s codec=%s",
+            stream_id,
+            ssrc_id,
+            codec,
+        )
         message = {
             "_id": secrets.token_hex(3),
             "_type": "subscribe",

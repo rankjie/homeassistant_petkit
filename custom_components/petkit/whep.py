@@ -270,7 +270,10 @@ class PetkitWhepView(HomeAssistantView):
 
             rtm = AgoraRTMSignaling(AGORA_APP_ID)
             handler = AgoraWebSocketHandler(
-                rtc_token_provider=camera._refresh_rtc_token
+                rtc_token_provider=camera._refresh_rtc_token,
+                prefer_instant_video=True,
+                subscribe_retry_delay=1.0,
+                subscribe_retry_attempts=3,
             )
 
             parsed_candidates = _add_offer_candidates(handler, offer_sdp)

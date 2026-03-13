@@ -25,7 +25,9 @@ from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraWebSocketHandler
 from .const import (
     AGORA_APP_ID,
+    CONF_ALWAYS_ON_STREAM,
     CONF_STREAM_CONTROL_MODE,
+    DEFAULT_ALWAYS_ON_STREAM,
     DEFAULT_STREAM_CONTROL_MODE,
     DOMAIN,
     LOGGER,
@@ -162,7 +164,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
-        if AIORTC_IMPORT_ERROR is None:
+        if AIORTC_IMPORT_ERROR is None and self._always_on_stream_enabled():
             _get_manager(self.hass).register_persistent_camera(self)
 
     async def async_will_remove_from_hass(self) -> None:
@@ -207,28 +209,32 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
         if AIORTC_IMPORT_ERROR is None:
             manager = _get_manager(self.hass)
-            self._pending_mirror_browser_sessions.add(session_id)
-            try:
-                _, answer_sdp = await manager.create_downstream_offer(
-                    self,
-                    offer_sdp,
-                    session_id=session_id,
-                    kind="browser",
-                )
-                await self._flush_pending_mirror_candidates(manager, session_id)
-            except (OSError, RuntimeError, ValueError) as err:
-                self._pending_mirror_browser_sessions.discard(session_id)
-                self._pending_mirror_browser_candidates.pop(session_id, None)
-                LOGGER.warning(
-                    "Mirror browser startup failed for %s, falling back to direct path: %s",
-                    self.device.id,
-                    err,
-                )
-            else:
-                self._mirror_browser_sessions.add(session_id)
-                self._pending_mirror_browser_sessions.discard(session_id)
-                send_message(WebRTCAnswer(answer_sdp))
-                return
+            use_mirror_first = self._always_on_stream_enabled() or await manager.has_upstream(
+                str(self.device.id)
+            )
+            if use_mirror_first:
+                self._pending_mirror_browser_sessions.add(session_id)
+                try:
+                    _, answer_sdp = await manager.create_downstream_offer(
+                        self,
+                        offer_sdp,
+                        session_id=session_id,
+                        kind="browser",
+                    )
+                    await self._flush_pending_mirror_candidates(manager, session_id)
+                except (OSError, RuntimeError, ValueError) as err:
+                    self._pending_mirror_browser_sessions.discard(session_id)
+                    self._pending_mirror_browser_candidates.pop(session_id, None)
+                    LOGGER.warning(
+                        "Mirror browser startup failed for %s, falling back to direct path: %s",
+                        self.device.id,
+                        err,
+                    )
+                else:
+                    self._mirror_browser_sessions.add(session_id)
+                    self._pending_mirror_browser_sessions.discard(session_id)
+                    send_message(WebRTCAnswer(answer_sdp))
+                    return
 
         await self._agora_handler.disconnect()
         self._agora_handler.candidates = []
@@ -478,6 +484,15 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if mode not in (STREAM_CONTROL_SHARED, STREAM_CONTROL_EXCLUSIVE):
             return DEFAULT_STREAM_CONTROL_MODE
         return mode
+
+    def _always_on_stream_enabled(self) -> bool:
+        """Return whether the mirror relay should stay prewarmed."""
+        return bool(
+            self.coordinator.config_entry.options.get(
+                CONF_ALWAYS_ON_STREAM,
+                DEFAULT_ALWAYS_ON_STREAM,
+            )
+        )
 
     async def _refresh_rtc_token(self) -> str | None:
         """Fetch fresh live feed tokens and return the latest RTC token."""

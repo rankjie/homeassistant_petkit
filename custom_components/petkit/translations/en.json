@@ -750,8 +750,12 @@
     "step": {
       "init": {
         "data": {
+          "always_on_stream": "Always On Stream",
           "region": "Region",
           "time_zone": "Timezone"
+        },
+        "data_description": {
+          "always_on_stream": "Keep the internal mirror relay stream prewarmed so browser and WHEP consumers can connect faster. This uses more device and cloud resources."
         },
         "sections": {
           "bluetooth_options": {

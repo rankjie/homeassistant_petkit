@@ -1,4 +1,4 @@
-"""Mirror WHEP endpoint — delegates to camera entity's browser WebRTC path."""
+"""Mirror WHEP endpoint using the camera entity's browser WebRTC path."""
 
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ class PetkitWhepMirrorView(HomeAssistantView):
 
         session_id = secrets.token_hex(16)
 
-        # Delegate to the camera entity's browser WebRTC handler
-        # (inline ICE candidates from SDP are extracted inside camera.py)
+        # Delegate to the camera entity's browser WebRTC handler, but defer the
+        # media start until after the HTTP answer is written back to the client.
         result = {}
 
         def send_message(msg):
@@ -53,7 +53,12 @@ class PetkitWhepMirrorView(HomeAssistantView):
             elif isinstance(msg, WebRTCError):
                 result["error"] = msg.message
 
-        await camera.async_handle_async_webrtc_offer(offer_sdp, session_id, send_message)
+        await camera.async_handle_async_webrtc_offer(
+            offer_sdp,
+            session_id,
+            send_message,
+            defer_media_start=True,
+        )
 
         # Track session for DELETE cleanup
         mirror_sessions = hass.data.setdefault(DOMAIN, {}).setdefault(
@@ -62,12 +67,19 @@ class PetkitWhepMirrorView(HomeAssistantView):
         mirror_sessions[device_id] = {"session_id": session_id, "camera": camera}
 
         if "answer" in result:
-            return web.Response(
+            response = web.StreamResponse(
                 status=201,
-                body=result["answer"],
-                content_type="application/sdp",
-                headers={"Location": f"/api/petkit/whep_mirror/{device_id}"},
+                headers={
+                    "Content-Type": "application/sdp",
+                    "Location": f"/api/petkit/whep_mirror/{device_id}",
+                },
             )
+            await response.prepare(request)
+            await response.write(result["answer"].encode())
+            await response.write_eof()
+
+            camera.schedule_deferred_media_start(delay=1.0)
+            return response
 
         return web.Response(status=502, text=result.get("error", "Negotiation failed"))
 

@@ -108,6 +108,12 @@ class AgoraWebSocketHandler:
         """Collect browser ICE candidates before join_v3."""
         self.candidates.append(candidate)
 
+    def configure_media_start(self, *, defer_media_start: bool) -> None:
+        """Configure whether role/subscription messages are deferred."""
+        self._defer_media_start = defer_media_start
+        self._media_start_active = not defer_media_start
+        self._pending_client_role = None
+
     async def connect_and_join(
         self,
         live_feed: LiveFeed,

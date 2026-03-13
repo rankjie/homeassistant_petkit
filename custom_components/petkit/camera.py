@@ -178,9 +178,14 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         offer_sdp: str,
         session_id: str,
         send_message: WebRTCSendMessage,
+        *,
+        defer_media_start: bool = False,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
         await self._agora_handler.disconnect()
+        self._agora_handler.configure_media_start(
+            defer_media_start=defer_media_start
+        )
         self._agora_handler.candidates = []
 
         # Extract inline ICE candidates from SDP (for WHEP/go2rtc clients)
@@ -251,6 +256,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                     message=str(err),
                 )
             )
+
+    def schedule_deferred_media_start(self, delay: float) -> None:
+        """Start deferred media flow for WHEP-style mirror sessions."""
+        self.hass.async_create_task(self._agora_handler.activate_media_start(delay))
 
     async def async_on_webrtc_candidate(
         self,

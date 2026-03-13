@@ -99,7 +99,7 @@ class PetkitMirrorRelayManager:
         """Create or reuse an upstream ingest, then answer one downstream offer."""
         device_id = str(camera.device.id)
         if kind == "whep":
-            await self._close_downstreams_by_kind(device_id, kind)
+            await self.close_downstreams_by_kind(device_id, kind)
         elif session_id is not None:
             await self.close_downstream(device_id, session_id)
         upstream = await self._ensure_upstream(camera)

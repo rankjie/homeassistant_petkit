@@ -147,8 +147,9 @@ class PetkitMirrorRelayManager:
                 state,
             )
             if state in {"failed", "closed"}:
-                self.hass.async_create_task(
-                    self._handle_downstream_closed(device_id, session_id)
+                self.hass.async_create_background_task(
+                    self._handle_downstream_closed(device_id, session_id),
+                    f"petkit mirror close downstream {device_id}",
                 )
 
         sender = peer_connection.addTrack(upstream.relay.subscribe(upstream.video_track))
@@ -390,7 +391,10 @@ class PetkitMirrorRelayManager:
                     device_id,
                     track.kind,
                 )
-                self.hass.async_create_task(self.close_device(device_id))
+                self.hass.async_create_background_task(
+                    self.close_device(device_id),
+                    f"petkit mirror close device {device_id}",
+                )
 
         @peer_connection.on("connectionstatechange")
         async def on_connectionstatechange() -> None:
@@ -398,7 +402,10 @@ class PetkitMirrorRelayManager:
             LOGGER.debug("WHEP mirror upstream %s state=%s", device_id, state)
             if state in {"failed", "closed"}:
                 upstream.last_error = f"upstream connection state={state}"
-                self.hass.async_create_task(self.close_device(device_id))
+                self.hass.async_create_background_task(
+                    self.close_device(device_id),
+                    f"petkit mirror close device {device_id}",
+                )
 
         transceiver = peer_connection.addTransceiver("video", direction="recvonly")
         self._prefer_h264_transceiver(transceiver)
@@ -424,7 +431,7 @@ class PetkitMirrorRelayManager:
 
         rtm_started = await upstream.agora_rtm.start_live(live_feed)
         if not rtm_started:
-            LOGGER.warning(
+            LOGGER.debug(
                 "WHEP mirror upstream %s RTM start_live not acknowledged",
                 device_id,
             )
@@ -449,8 +456,9 @@ class PetkitMirrorRelayManager:
             RTCSessionDescription(sdp=answer_sdp, type="answer")
         )
         await asyncio.wait_for(upstream.video_ready.wait(), timeout=20)
-        upstream.refresh_task = self.hass.async_create_task(
-            self._refresh_tokens(upstream)
+        upstream.refresh_task = self.hass.async_create_background_task(
+            self._refresh_tokens(upstream),
+            f"petkit mirror refresh tokens {device_id}",
         )
 
         async with self._lock:
@@ -499,8 +507,9 @@ class PetkitMirrorRelayManager:
         if task is not None and not task.done() and task is not asyncio.current_task():
             return
 
-        prewarm_task = self.hass.async_create_task(
-            self._prewarm_upstream(device_id, delay)
+        prewarm_task = self.hass.async_create_background_task(
+            self._prewarm_upstream(device_id, delay),
+            f"petkit mirror prewarm {device_id}",
         )
         self._prewarm_tasks[device_id] = prewarm_task
 

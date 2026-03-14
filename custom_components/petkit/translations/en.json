@@ -732,6 +732,9 @@
     "camera": {
       "camera": {
         "name": "Camera stream"
+      },
+      "relay_camera": {
+        "name": "Relay stream"
       }
     },
     "text": {
@@ -755,7 +758,7 @@
           "time_zone": "Timezone"
         },
         "data_description": {
-          "always_on_stream": "Keep the internal mirror relay stream prewarmed so browser and WHEP consumers can connect faster. This uses more device and cloud resources."
+          "always_on_stream": "Keep the internal mirror relay stream prewarmed so browser and WHEP consumers can connect faster, and expose a relay-backed camera entity through HA-managed go2rtc. This uses more device and cloud resources."
         },
         "sections": {
           "bluetooth_options": {

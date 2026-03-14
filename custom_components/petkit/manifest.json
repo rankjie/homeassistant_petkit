@@ -2,7 +2,8 @@
   "domain": "petkit",
   "name": "Petkit",
   "after_dependencies": [
-    "web_rtc"
+    "web_rtc",
+    "go2rtc"
   ],
   "codeowners": [
     "@Jezza34000"
@@ -22,5 +23,5 @@
     "sdp-transform==1.1.0",
     "aiortc==1.14.0"
   ],
-  "version": "1.23.3.dev13"
+  "version": "1.23.3.dev14"
 }

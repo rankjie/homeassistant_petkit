@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
+import ipaddress
 import secrets
 from typing import TYPE_CHECKING, Any
 
@@ -610,24 +611,64 @@ async def async_cleanup_whep_mirror_sessions(hass) -> None:
         await manager.close_all()
 
 
-class PetkitWhepMirrorView(HomeAssistantView):
-    """WHEP endpoint that relays one internal aiortc ingest."""
+def _check_external_auth(request: web.Request) -> web.Response | None:
+    """Allow authenticated HA users or explicit access tokens."""
+    hass = request.app["hass"]
+    if request.get("hass_user"):
+        return None
 
-    url = "/api/petkit/whep_mirror/{device_id}"
-    name = "api:petkit:whep_mirror"
+    token = request.query.get("token")
+    if token:
+        if hass.auth.async_validate_access_token(token) is None:
+            return web.Response(status=401, text="Invalid token")
+        return None
+
+    return web.Response(status=401, text="Authentication required")
+
+
+def _is_loopback_request(request: web.Request) -> bool:
+    """Return whether the request originates from localhost."""
+    remote = request.remote
+    if remote:
+        with contextlib.suppress(ValueError):
+            return ipaddress.ip_address(remote).is_loopback
+
+    peername = None
+    if request.transport is not None:
+        peername = request.transport.get_extra_info("peername")
+
+    if isinstance(peername, tuple) and peername:
+        host = peername[0]
+        with contextlib.suppress(ValueError):
+            return ipaddress.ip_address(host).is_loopback
+
+    return False
+
+
+def _check_internal_auth(request: web.Request) -> web.Response | None:
+    """Allow only loopback requests for the internal mirror endpoint."""
+    if _is_loopback_request(request):
+        return None
+    return web.Response(status=403, text="Internal endpoint is loopback-only")
+
+
+class _BasePetkitWhepMirrorView(HomeAssistantView):
+    """Shared WHEP mirror endpoint logic."""
+
     requires_auth = False
+    _downstream_kind = "whep"
 
-    async def post(self, request: web.Request, device_id: str) -> web.Response:
+    def _check_auth(self, request: web.Request) -> web.Response | None:
+        """Validate request authentication for this endpoint."""
+        raise NotImplementedError
+
+    async def _post_impl(self, request: web.Request, device_id: str) -> web.Response:
         """Receive SDP offer, relay via an internal aiortc peer, return answer."""
         hass = request.app["hass"]
 
-        if not request.get("hass_user"):
-            token = request.query.get("token")
-            if token:
-                if hass.auth.async_validate_access_token(token) is None:
-                    return web.Response(status=401, text="Invalid token")
-            else:
-                return web.Response(status=401, text="Authentication required")
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
 
         cameras = hass.data.get(DOMAIN, {}).get("cameras", {})
         camera = cameras.get(device_id)
@@ -650,7 +691,7 @@ class PetkitWhepMirrorView(HomeAssistantView):
             _, answer_sdp = await manager.create_downstream_offer(
                 camera,
                 offer_sdp,
-                kind="whep",
+                kind=self._downstream_kind,
             )
         except asyncio.TimeoutError:
             LOGGER.error("WHEP mirror timed out for %s", device_id)
@@ -663,7 +704,7 @@ class PetkitWhepMirrorView(HomeAssistantView):
             status=201,
             headers={
                 "Content-Type": "application/sdp",
-                "Location": f"/api/petkit/whep_mirror/{device_id}",
+                "Location": request.path,
             },
         )
         await response.prepare(request)
@@ -671,20 +712,58 @@ class PetkitWhepMirrorView(HomeAssistantView):
         await response.write_eof()
         return response
 
-    async def delete(self, request: web.Request, device_id: str) -> web.Response:
+    async def _delete_impl(self, request: web.Request, device_id: str) -> web.Response:
         """Tear down an active mirror session."""
         hass = request.app["hass"]
 
-        if not request.get("hass_user"):
-            token = request.query.get("token")
-            if token:
-                if hass.auth.async_validate_access_token(token) is None:
-                    return web.Response(status=401, text="Invalid token")
-            else:
-                return web.Response(status=401, text="Authentication required")
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
 
         manager = _get_manager(hass)
-        if not await manager.close_downstreams_by_kind(device_id, "whep"):
+        if not await manager.close_downstreams_by_kind(
+            device_id, self._downstream_kind
+        ):
             return web.Response(status=404, text="No active mirror session")
 
         return web.Response(status=200, text="Session closed")
+
+
+class PetkitWhepMirrorView(_BasePetkitWhepMirrorView):
+    """Public WHEP endpoint for external consumers."""
+
+    url = "/api/petkit/whep_mirror/{device_id}"
+    name = "api:petkit:whep_mirror"
+    _downstream_kind = "whep"
+
+    def _check_auth(self, request: web.Request) -> web.Response | None:
+        """Allow HA user auth or token query auth."""
+        return _check_external_auth(request)
+
+    async def post(self, request: web.Request, device_id: str) -> web.Response:
+        """Receive SDP offer, relay via an internal aiortc peer, return answer."""
+        return await self._post_impl(request, device_id)
+
+    async def delete(self, request: web.Request, device_id: str) -> web.Response:
+        """Tear down an active mirror session."""
+        return await self._delete_impl(request, device_id)
+
+
+class PetkitInternalWhepMirrorView(_BasePetkitWhepMirrorView):
+    """Loopback-only WHEP endpoint for HA-managed internal consumers."""
+
+    url = "/api/petkit/whep_internal/{device_id}"
+    name = "api:petkit:whep_internal"
+    _downstream_kind = "internal"
+
+    def _check_auth(self, request: web.Request) -> web.Response | None:
+        """Allow loopback requests only."""
+        return _check_internal_auth(request)
+
+    async def post(self, request: web.Request, device_id: str) -> web.Response:
+        """Receive SDP offer for an internal consumer."""
+        return await self._post_impl(request, device_id)
+
+    async def delete(self, request: web.Request, device_id: str) -> web.Response:
+        """Tear down an active internal mirror session."""
+        return await self._delete_impl(request, device_id)

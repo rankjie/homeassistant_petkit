@@ -708,6 +708,14 @@
         "name": "照明"
       }
     },
+    "camera": {
+      "camera": {
+        "name": "摄像头视频流"
+      },
+      "relay_camera": {
+        "name": "中继视频流"
+      }
+    },
     "text": {
       "manual_feed_dual_h1": {
         "name": "1号粮仓手动出粮"
@@ -731,7 +739,7 @@
           "time_zone": "时区"
         },
         "data_description": {
-          "always_on_stream": "保持内部镜像中继视频流处于预热状态，以便浏览器和 WHEP 客户端能更快连接。这会占用更多设备和云端资源。",
+          "always_on_stream": "保持内部镜像中继视频流处于预热状态，以便浏览器和 WHEP 客户端能更快连接，并通过 HA 内置 go2rtc 暴露一个中继摄像头实体。这会占用更多设备和云端资源。",
           "smart_polling": "智能轮询会根据设备的事件/操作自动调整轮询间隔。"
         },
         "sections": {

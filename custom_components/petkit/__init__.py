@@ -40,6 +40,7 @@ from .coordinator import (
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
 from .whep_mirror import (
+    PetkitInternalWhepMirrorView,
     PetkitWhepMirrorView,
     async_cleanup_whep_mirror_sessions,
 )
@@ -117,6 +118,7 @@ async def async_setup_entry(
 
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitSessionView())
+    hass.http.register_view(PetkitInternalWhepMirrorView())
     hass.http.register_view(PetkitWhepMirrorView())
 
     country_from_ha = hass.config.country

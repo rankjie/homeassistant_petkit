@@ -17,6 +17,7 @@ from homeassistant.components.camera import (
 )
 from homeassistant.components.web_rtc import async_register_ice_servers
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 
@@ -85,8 +86,6 @@ async def async_setup_entry(
         for entity_description in descriptions
         if entity_description.is_supported(device)
     ]
-    relay_entities: list[PetkitMirrorStreamCamera] = []
-
     if entities:
         results = await asyncio.gather(
             *(entity.async_prepare_agora() for entity in entities),
@@ -100,21 +99,39 @@ async def async_setup_entry(
                     result,
                 )
 
-    if entry.options.get(CONF_ALWAYS_ON_STREAM, DEFAULT_ALWAYS_ON_STREAM):
-        from .whep_mirror import AIORTC_IMPORT_ERROR
+    _async_cleanup_legacy_relay_camera_entities(hass, entities)
+    async_add_entities(entities)
 
-        if AIORTC_IMPORT_ERROR is None:
-            relay_entities = [
-                PetkitMirrorStreamCamera(source_camera=entity, hass=hass)
-                for entity in entities
-            ]
-        else:
+
+@callback
+def _async_cleanup_legacy_relay_camera_entities(
+    hass: HomeAssistant,
+    entities: list["PetkitWebRTCCamera"],
+) -> None:
+    """Remove legacy companion relay camera entities after merging into the source camera."""
+    if not entities:
+        return
+
+    entity_registry = er.async_get(hass)
+
+    for entity in entities:
+        relay_entity_id = entity_registry.async_get_entity_id(
+            "camera",
+            DOMAIN,
+            f"{entity.device.device_nfo.device_type}_{entity.device.sn}_relay_camera",
+        )
+        if relay_entity_id is None:
+            continue
+
+        try:
+            entity_registry.async_remove(relay_entity_id)
+        except ValueError as err:
             LOGGER.debug(
-                "Skipping PetKit relay camera entities because aiortc is unavailable: %s",
-                AIORTC_IMPORT_ERROR,
+                "Unable to remove legacy relay camera entity %s for %s: %s",
+                relay_entity_id,
+                entity.device.id,
+                err,
             )
-
-    async_add_entities([*entities, *relay_entities])
 
 
 class PetkitWebRTCCamera(PetkitCameraBaseEntity):
@@ -147,6 +164,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._mirror_browser_sessions: set[str] = set()
         self._pending_mirror_browser_sessions: set[str] = set()
         self._pending_mirror_browser_candidates: dict[str, list[RTCIceCandidateInit]] = {}
+        self._go2rtc_manager = get_go2rtc_stream_manager(hass)
 
     @property
     def available(self) -> bool:
@@ -155,7 +173,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose mirror WHEP URL for go2rtc / external WebRTC consumers."""
+        """Expose rebroadcast URLs when available."""
         mirror_path = f"/api/petkit/whep_mirror/{self.device.id}"
         try:
             base_url = get_url(self.hass, prefer_external=False)
@@ -164,9 +182,24 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         else:
             mirror_url = f"{base_url.rstrip('/')}{mirror_path}"
 
-        return {
+        attributes = {
             "whep_mirror_url": mirror_url,
         }
+
+        if self._always_on_stream_enabled():
+            internal_source = self._go2rtc_manager.internal_webrtc_source(
+                str(self.device.id)
+            )
+            if internal_source is not None:
+                attributes["whep_internal_url"] = internal_source.removeprefix(
+                    "webrtc:"
+                )
+            if self._go2rtc_manager.is_managed_available():
+                attributes["stream_source_url"] = self._go2rtc_manager.rtsp_url(
+                    str(self.device.id)
+                )
+
+        return attributes
 
     async def async_added_to_hass(self) -> None:
         """Register ICE callback when entity is added."""
@@ -196,6 +229,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if AIORTC_IMPORT_ERROR is None:
             _get_manager(self.hass).unregister_persistent_camera(str(self.device.id))
 
+        await self._go2rtc_manager.async_remove_stream(str(self.device.id))
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -213,6 +247,19 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     ) -> bytes | None:
         """WebRTC cameras do not provide still snapshots directly."""
         return None
+
+    async def stream_source(self) -> str | None:
+        """Return the rebroadcast RTSP source when the option is enabled."""
+        if not self._always_on_stream_enabled():
+            return None
+
+        stream_source = await self._go2rtc_manager.async_ensure_stream(str(self.device.id))
+        if stream_source is None:
+            LOGGER.debug(
+                "Rebroadcast stream source unavailable for %s",
+                self.device.id,
+            )
+        return stream_source
 
     async def async_handle_async_webrtc_offer(
         self,
@@ -616,77 +663,3 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 ):
                     filtered.append(candidate)
         return filtered or candidates
-
-
-class PetkitMirrorStreamCamera(PetkitCameraBaseEntity):
-    """Relay-backed camera entity exposed through HA-managed go2rtc."""
-
-    def __init__(
-        self,
-        source_camera: PetkitWebRTCCamera,
-        hass: HomeAssistant,
-    ) -> None:
-        """Initialize the relay-backed camera entity."""
-        super().__init__(
-            source_camera.coordinator,
-            source_camera.device,
-            "relay_camera",
-        )
-        self.hass = hass
-        self.coordinator = source_camera.coordinator
-        self.device = source_camera.device
-        self._source_camera = source_camera
-        self._attr_translation_key = "relay_camera"
-        self._go2rtc_manager = get_go2rtc_stream_manager(hass)
-
-    @property
-    def available(self) -> bool:
-        """Return whether the relay-backed stream can currently be used."""
-        return (
-            self._source_camera.available
-            and self._go2rtc_manager.is_managed_available()
-            and self._go2rtc_manager.internal_webrtc_source(str(self.device.id))
-            is not None
-        )
-
-    @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        """Expose the local and external relay URLs for this camera."""
-        attributes = {
-            "stream_source_url": self._go2rtc_manager.rtsp_url(str(self.device.id)),
-        }
-
-        internal_source = self._go2rtc_manager.internal_webrtc_source(str(self.device.id))
-        if internal_source is not None:
-            attributes["whep_internal_url"] = internal_source.removeprefix("webrtc:")
-
-        external_url = self._source_camera.extra_state_attributes.get("whep_mirror_url")
-        if external_url:
-            attributes["whep_mirror_url"] = external_url
-
-        return attributes
-
-    async def async_camera_image(
-        self,
-        width: int | None = None,
-        height: int | None = None,
-    ) -> bytes | None:
-        """Return the same snapshot behavior as the native camera entity."""
-        return await self._source_camera.async_camera_image(width, height)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Cleanup the internal go2rtc stream registration."""
-        await self._go2rtc_manager.async_remove_stream(str(self.device.id))
-        await super().async_will_remove_from_hass()
-
-    async def stream_source(self) -> str | None:
-        """Return the local RTSP source exposed by HA-managed go2rtc."""
-        stream_source = await self._go2rtc_manager.async_ensure_stream(
-            str(self.device.id)
-        )
-        if stream_source is None:
-            LOGGER.debug(
-                "Relay stream source unavailable for %s",
-                self.device.id,
-            )
-        return stream_source

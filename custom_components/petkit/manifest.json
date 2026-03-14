@@ -23,5 +23,5 @@
     "sdp-transform==1.1.0",
     "aiortc==1.14.0"
   ],
-  "version": "1.23.4.dev2"
+  "version": "1.23.4.dev3"
 }

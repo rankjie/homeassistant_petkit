@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from http import HTTPStatus
 
-from aiohttp import ClientError, ClientTimeout
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from homeassistant.components.go2rtc.const import (
     DOMAIN as GO2RTC_DOMAIN,
@@ -28,12 +28,29 @@ class PetkitGo2RTCStreamManager:
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the go2rtc helper."""
         self.hass = hass
-        self._session = async_get_clientsession(hass)
         self._locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def _session(self) -> ClientSession:
+        """Return the aiohttp session for go2rtc API calls."""
+        go2rtc_data = self.hass.data.get(GO2RTC_DOMAIN)
+        session = getattr(go2rtc_data, "session", None)
+        if session is not None:
+            return session
+        return async_get_clientsession(self.hass)
+
+    @property
+    def _base_url(self) -> str:
+        """Return the go2rtc API base URL."""
+        go2rtc_data = self.hass.data.get(GO2RTC_DOMAIN)
+        url = getattr(go2rtc_data, "url", None)
+        return url if url else HA_MANAGED_URL
 
     def is_managed_available(self) -> bool:
         """Return whether HA-managed go2rtc is active."""
-        return self.hass.data.get(GO2RTC_DOMAIN) == HA_MANAGED_URL
+        go2rtc_data = self.hass.data.get(GO2RTC_DOMAIN)
+        url = getattr(go2rtc_data, "url", go2rtc_data)
+        return url == HA_MANAGED_URL
 
     def stream_name(self, device_id: str) -> str:
         """Return the deterministic go2rtc stream name for one device."""
@@ -142,7 +159,7 @@ class PetkitGo2RTCStreamManager:
         """Fetch the current go2rtc streams payload."""
         try:
             async with self._session.get(
-                f"{HA_MANAGED_URL}{_GO2RTC_API_PATH}",
+                f"{self._base_url}{_GO2RTC_API_PATH}",
                 timeout=_REQUEST_TIMEOUT,
             ) as response:
                 if response.status != HTTPStatus.OK:
@@ -161,7 +178,7 @@ class PetkitGo2RTCStreamManager:
         request: Callable[..., object] = getattr(self._session, method)
         try:
             async with request(
-                f"{HA_MANAGED_URL}{_GO2RTC_API_PATH}",
+                f"{self._base_url}{_GO2RTC_API_PATH}",
                 params=params,
                 timeout=_REQUEST_TIMEOUT,
             ) as response:

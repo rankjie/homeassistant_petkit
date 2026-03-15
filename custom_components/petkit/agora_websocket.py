@@ -945,11 +945,22 @@ class AgoraWebSocketHandler:
             dtls_parameters = ortc.get("dtlsParameters", {})
 
             rtp_capabilities = ortc.get("rtpCapabilities", {})
-            caps = (
-                rtp_capabilities.get("sendrecv")
-                or rtp_capabilities.get("recv")
-                or rtp_capabilities.get("send")
-                or rtp_capabilities
+            audio_codecs, audio_extensions = self._collect_media_capabilities(
+                rtp_capabilities,
+                media_type="audio",
+            )
+            video_codecs, video_extensions = self._collect_media_capabilities(
+                rtp_capabilities,
+                media_type="video",
+            )
+            LOGGER.debug(
+                "Agora answer SDP capabilities: keys=%s audio_codecs=%d "
+                "video_codecs=%d audio_extensions=%d video_extensions=%d",
+                sorted(rtp_capabilities.keys()),
+                len(audio_codecs),
+                len(video_codecs),
+                len(audio_extensions),
+                len(video_extensions),
             )
 
             candidates = ice_parameters.get("candidates", []) or []
@@ -986,11 +997,6 @@ class AgoraWebSocketHandler:
                 if candidate.get("generation") is not None:
                     line += f" generation {candidate.get('generation')}"
                 candidates_by_mid["*"].append(line)
-
-            audio_codecs = caps.get("audioCodecs", []) or []
-            video_codecs = caps.get("videoCodecs", []) or []
-            audio_extensions = caps.get("audioExtensions", []) or []
-            video_extensions = caps.get("videoExtensions", []) or []
 
             def _answer_direction(offer_direction: str) -> str:
                 if offer_direction == "sendonly":
@@ -1035,6 +1041,14 @@ class AgoraWebSocketHandler:
                 extensions = (
                     audio_extensions if media_type == "audio" else video_extensions
                 )
+                if not codecs:
+                    codecs = self._codecs_from_offer_media(media)
+                    LOGGER.debug(
+                        "Agora answer SDP codec fallback: media=%s mid=%s codecs=%d",
+                        media_type,
+                        mid,
+                        len(codecs),
+                    )
 
                 payload_types = [str(codec.get("payloadType")) for codec in codecs]
                 if not payload_types:
@@ -1122,6 +1136,131 @@ class AgoraWebSocketHandler:
         except (AttributeError, TypeError, ValueError) as err:
             LOGGER.error("Failed to generate answer SDP: %s", err)
             return None
+
+    @classmethod
+    def _collect_media_capabilities(
+        cls,
+        rtp_capabilities: dict[str, Any],
+        *,
+        media_type: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Collect codecs/extensions across capability buckets for one media type."""
+        codec_key = f"{media_type}Codecs"
+        extension_key = f"{media_type}Extensions"
+
+        capability_sources: list[dict[str, Any]] = []
+        for key in ("sendrecv", "send", "recv"):
+            bucket = rtp_capabilities.get(key)
+            if isinstance(bucket, dict):
+                capability_sources.append(bucket)
+
+        # Some Agora payloads flatten capability keys at the top level.
+        if any(key in rtp_capabilities for key in (codec_key, extension_key)):
+            capability_sources.append(rtp_capabilities)
+
+        codecs = cls._merge_capability_items(
+            [source.get(codec_key, []) or [] for source in capability_sources],
+            identity=cls._codec_identity,
+        )
+        extensions = cls._merge_capability_items(
+            [source.get(extension_key, []) or [] for source in capability_sources],
+            identity=cls._extension_identity,
+        )
+        return codecs, extensions
+
+    @staticmethod
+    def _merge_capability_items(
+        item_lists: list[list[dict[str, Any]]],
+        *,
+        identity: Callable[[dict[str, Any]], Any],
+    ) -> list[dict[str, Any]]:
+        """Merge capability items while keeping first-seen order."""
+        merged: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+
+        for items in item_lists:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                key = identity(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+
+        return merged
+
+    @staticmethod
+    def _codec_identity(codec: dict[str, Any]) -> tuple[Any, ...]:
+        """Build a stable identity for codec capability deduplication."""
+        rtp_map = codec.get("rtpMap") or {}
+        return (
+            codec.get("payloadType"),
+            rtp_map.get("encodingName"),
+            rtp_map.get("clockRate"),
+            rtp_map.get("encodingParameters"),
+        )
+
+    @staticmethod
+    def _extension_identity(extension: dict[str, Any]) -> tuple[Any, ...]:
+        """Build a stable identity for header extension deduplication."""
+        return (extension.get("extensionName"), extension.get("entry"))
+
+    @classmethod
+    def _codecs_from_offer_media(cls, media: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extract codec definitions from the SDP offer for fallback answers."""
+        codecs_by_payload: dict[int, dict[str, Any]] = {}
+        payload_order: list[int] = []
+
+        for payload in str(media.get("payloads", "")).split():
+            payload_type = cls._coerce_int(payload)
+            if payload_type is not None:
+                payload_order.append(payload_type)
+
+        for rtp in media.get("rtp", []):
+            payload_type = cls._coerce_int(rtp.get("payload"))
+            if payload_type is None:
+                continue
+
+            codec = {
+                "payloadType": payload_type,
+                "rtpMap": {
+                    "encodingName": rtp.get("codec"),
+                    "clockRate": rtp.get("rate"),
+                    "encodingParameters": rtp.get("encoding"),
+                },
+                "rtcpFeedbacks": [],
+                "fmtp": {"parameters": {}},
+            }
+
+            for feedback in media.get("rtcpFb", []):
+                feedback_payload = feedback.get("payload")
+                if feedback_payload not in (payload_type, str(payload_type), "*"):
+                    continue
+                codec["rtcpFeedbacks"].append(
+                    {
+                        "type": feedback.get("type"),
+                        "parameter": feedback.get("subtype"),
+                    }
+                )
+
+            for fmtp in media.get("fmtp", []):
+                if cls._coerce_int(fmtp.get("payload")) != payload_type:
+                    continue
+                for part in str(fmtp.get("config", "")).split(";"):
+                    if "=" not in part:
+                        continue
+                    key, value = part.split("=", 1)
+                    codec["fmtp"]["parameters"][key.strip()] = value.strip()
+
+            codecs_by_payload[payload_type] = codec
+
+        ordered_payloads = payload_order or list(codecs_by_payload)
+        return [
+            codecs_by_payload[payload_type]
+            for payload_type in ordered_payloads
+            if payload_type in codecs_by_payload
+        ]
 
     @staticmethod
     def _validate_sdp(sdp: str) -> bool:

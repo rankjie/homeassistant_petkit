@@ -25,6 +25,7 @@ from .webrtc_common import (
 
 try:
     from aiortc import (
+        MediaStreamTrack,
         RTCConfiguration,
         RTCIceServer as AiortcIceServer,
         RTCPeerConnection,
@@ -34,6 +35,7 @@ try:
     from aiortc.contrib.media import MediaRelay
     from aiortc.sdp import candidate_from_sdp
 except Exception as err:  # noqa: BLE001
+    MediaStreamTrack = object
     RTCConfiguration = None
     AiortcIceServer = None
     RTCPeerConnection = None
@@ -49,6 +51,62 @@ if TYPE_CHECKING:
     from .camera import PetkitWebRTCCamera
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
+
+
+class _LoggingAudioTrack(MediaStreamTrack):
+    """Wrap an audio track and log received frames."""
+
+    kind = "audio"
+
+    def __init__(self, source: Any, *, device_id: str) -> None:
+        """Initialize the logging wrapper."""
+        super().__init__()
+        self._source = source
+        self._device_id = device_id
+        self._frame_count = 0
+
+    @property
+    def source(self) -> Any:
+        """Return the wrapped source track."""
+        return self._source
+
+    async def recv(self) -> Any:
+        """Receive one audio frame and log frame details periodically."""
+        try:
+            frame = await self._source.recv()
+        except Exception as err:
+            LOGGER.debug(
+                "WHEP rebroadcast upstream %s audio recv failed: %s",
+                self._device_id,
+                err,
+            )
+            raise
+
+        self._frame_count += 1
+        if self._frame_count <= 5 or self._frame_count % 50 == 0:
+            LOGGER.debug(
+                "WHEP rebroadcast upstream %s audio frame=%d bytes=%d "
+                "samples=%s rate=%s layout=%s format=%s pts=%s time=%s",
+                self._device_id,
+                self._frame_count,
+                self._frame_size_bytes(frame),
+                getattr(frame, "samples", None),
+                getattr(frame, "sample_rate", None),
+                getattr(getattr(frame, "layout", None), "name", None),
+                getattr(getattr(frame, "format", None), "name", None),
+                getattr(frame, "pts", None),
+                getattr(frame, "time", None),
+            )
+
+        return frame
+
+    @staticmethod
+    def _frame_size_bytes(frame: Any) -> int:
+        """Best-effort byte size for an audio frame."""
+        total = 0
+        for plane in getattr(frame, "planes", []) or []:
+            total += int(getattr(plane, "buffer_size", 0) or 0)
+        return total
 
 
 @dataclass
@@ -394,7 +452,7 @@ class PetkitMirrorRelayManager:
                 track.kind,
             )
             if track.kind == "audio" and upstream.audio_track is None:
-                upstream.audio_track = track
+                upstream.audio_track = _LoggingAudioTrack(track, device_id=device_id)
                 upstream.audio_ready.set()
             if track.kind == "video" and upstream.video_track is None:
                 upstream.video_track = track
@@ -408,7 +466,10 @@ class PetkitMirrorRelayManager:
                     track.kind,
                 )
                 if track.kind == "audio":
-                    if upstream.audio_track is track:
+                    if upstream.audio_track is track or (
+                        isinstance(upstream.audio_track, _LoggingAudioTrack)
+                        and upstream.audio_track.source is track
+                    ):
                         upstream.audio_track = None
                         upstream.audio_ready.clear()
                     return

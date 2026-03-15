@@ -72,8 +72,9 @@ class AgoraWebSocketHandler:
 
         self.candidates: list[RTCIceCandidateInit] = []
         self._online_users: set[int] = set()
+        self._audio_streams: dict[int, dict[str, Any]] = {}
         self._video_streams: dict[int, dict[str, Any]] = {}
-        self._subscribed_video_streams: set[tuple[int, int]] = set()
+        self._subscribed_streams: set[tuple[str, int, int]] = set()
 
         self._message_loop_task: asyncio.Task[None] | None = None
         self._ping_task: asyncio.Task[None] | None = None
@@ -97,7 +98,9 @@ class AgoraWebSocketHandler:
             "error": self._handle_error,
             "on_rtp_capability_change": self._handle_rtp_capability_change,
             "on_user_online": self._handle_user_online,
+            "on_add_audio_stream": self._handle_add_audio_stream,
             "on_add_video_stream": self._handle_add_video_stream,
+            "on_published_user_list": self._handle_published_user_list,
         }
 
     def add_ice_candidate(self, candidate: RTCIceCandidateInit) -> None:
@@ -128,9 +131,9 @@ class AgoraWebSocketHandler:
         # Add gathered candidates to ORTC offer before join_v3.
         gathered_candidates = self._convert_candidates_to_ortc()
         if gathered_candidates:
-            ortc_info.setdefault("iceParameters", {})[
-                "candidates"
-            ] = gathered_candidates
+            ortc_info.setdefault("iceParameters", {})["candidates"] = (
+                gathered_candidates
+            )
         LOGGER.debug(
             "Agora join_v3: session=%s gathered_candidates=%d",
             session_id,
@@ -334,7 +337,7 @@ class AgoraWebSocketHandler:
             return None
 
         await self._send_set_client_role(role="host", level=0)
-        await self._register_existing_video_streams(message)
+        await self._register_existing_streams(message)
 
         # Inject auth fingerprints if not present in ORTC payload.
         dtls_parameters = ortc.setdefault("dtlsParameters", {})
@@ -409,36 +412,112 @@ class AgoraWebSocketHandler:
     async def _handle_user_online(self, response: dict[str, Any]) -> None:
         """Track online users."""
         message = response.get("_message", {})
-        uid = message.get("uid")
-        if isinstance(uid, int):
+        uid = self._coerce_int(message.get("uid"))
+        if uid is not None:
             self._online_users.add(uid)
+
+    async def _handle_add_audio_stream(self, response: dict[str, Any]) -> None:
+        """Auto-subscribe to newly announced audio stream."""
+        await self._handle_add_stream(response, stream_type="audio")
 
     async def _handle_add_video_stream(self, response: dict[str, Any]) -> None:
         """Auto-subscribe to newly announced video stream."""
-        message = response.get("_message", {})
-        uid = message.get("uid")
-        ssrc_id = message.get("ssrcId")
-        rtx_ssrc_id = message.get("rtxSsrcId")
-        cname = message.get("cname")
-        is_video = bool(message.get("video"))
+        await self._handle_add_stream(response, stream_type="video")
 
-        if not isinstance(uid, int) or not is_video:
+    async def _handle_add_stream(
+        self,
+        response: dict[str, Any],
+        *,
+        stream_type: str,
+    ) -> None:
+        """Track one announced media stream and subscribe to it."""
+        message = response.get("_message", {})
+        uid = self._coerce_int(message.get("uid"))
+        if uid is None:
+            uid = self._coerce_int(message.get("stream_id"))
+        ssrc_id = self._coerce_int(message.get("ssrcId"))
+        if ssrc_id is None and stream_type == "audio":
+            ssrc_id = self._coerce_int(message.get("audio_ssrc"))
+        if ssrc_id is None and stream_type == "video":
+            ssrc_id = self._coerce_int(message.get("video_ssrc"))
+        if uid is None or ssrc_id is None:
             return
 
+        rtx_ssrc_id = None
+        if stream_type == "video":
+            rtx_ssrc_id = self._coerce_int(message.get("rtxSsrcId"))
+            if rtx_ssrc_id is None:
+                rtx_ssrc_id = self._coerce_int(message.get("video_rtx"))
+
         LOGGER.debug(
-            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s",
+            "Agora on_add_%s_stream: uid=%s ssrc=%s rtx_ssrc=%s",
+            stream_type,
             uid,
             ssrc_id,
             rtx_ssrc_id,
         )
-        self._video_streams[uid] = {
-            "ssrcId": ssrc_id,
-            "rtxSsrcId": rtx_ssrc_id,
-            "cname": cname,
-        }
+        self._remember_stream(
+            uid=uid,
+            ssrc_id=ssrc_id,
+            stream_type=stream_type,
+            rtx_ssrc_id=rtx_ssrc_id,
+            cname=message.get("cname"),
+            uint_id=self._coerce_int(message.get("uint_id")),
+            ortc=message.get("ortc"),
+        )
+        await self._subscribe_stream(
+            uid=uid,
+            ssrc_id=ssrc_id,
+            stream_type=stream_type,
+        )
 
-        if isinstance(ssrc_id, int):
-            await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
+    async def _handle_published_user_list(self, response: dict[str, Any]) -> None:
+        """Subscribe to streams announced in the published user list."""
+        message = response.get("_message", {})
+        users = message.get("users")
+        if not isinstance(users, list):
+            return
+
+        LOGGER.debug("Agora on_published_user_list: users=%d", len(users))
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            uid = self._coerce_int(user.get("stream_id"))
+            if uid is None:
+                uid = self._coerce_int(user.get("uid"))
+            if uid is None:
+                continue
+
+            audio_ssrc = self._coerce_int(user.get("audio_ssrc"))
+            if audio_ssrc is not None:
+                self._remember_stream(
+                    uid=uid,
+                    ssrc_id=audio_ssrc,
+                    stream_type="audio",
+                    uint_id=self._coerce_int(user.get("uint_id")),
+                    string_id=user.get("string_id"),
+                )
+                await self._subscribe_stream(
+                    uid=uid,
+                    ssrc_id=audio_ssrc,
+                    stream_type="audio",
+                )
+
+            video_ssrc = self._coerce_int(user.get("video_ssrc"))
+            if video_ssrc is not None:
+                self._remember_stream(
+                    uid=uid,
+                    ssrc_id=video_ssrc,
+                    stream_type="video",
+                    rtx_ssrc_id=self._coerce_int(user.get("video_rtx")),
+                    uint_id=self._coerce_int(user.get("uint_id")),
+                    string_id=user.get("string_id"),
+                )
+                await self._subscribe_stream(
+                    uid=uid,
+                    ssrc_id=video_ssrc,
+                    stream_type="video",
+                )
 
     async def _send_set_client_role(
         self, role: str = "audience", level: int = 1
@@ -475,7 +554,8 @@ class AgoraWebSocketHandler:
             return
 
         LOGGER.debug(
-            "Agora subscribe: stream_id=%s ssrc_id=%s codec=%s",
+            "Agora subscribe: stream_type=%s stream_id=%s ssrc_id=%s codec=%s",
+            stream_type,
             stream_id,
             ssrc_id,
             codec,
@@ -496,37 +576,94 @@ class AgoraWebSocketHandler:
             },
         }
         await self._websocket.send(json.dumps(message))
-        self._subscribed_video_streams.add((stream_id, ssrc_id))
+        self._subscribed_streams.add((stream_type, stream_id, ssrc_id))
 
-    async def _subscribe_video_stream(self, uid: int, ssrc_id: int) -> None:
-        """Subscribe once per `(uid, ssrc_id)` pair."""
-        if (uid, ssrc_id) in self._subscribed_video_streams:
+    async def _subscribe_stream(
+        self,
+        *,
+        uid: int,
+        ssrc_id: int,
+        stream_type: str,
+    ) -> None:
+        """Subscribe once per `(stream_type, uid, ssrc_id)` tuple."""
+        if (stream_type, uid, ssrc_id) in self._subscribed_streams:
             return
-        await self._send_subscribe(stream_id=uid, ssrc_id=ssrc_id, codec="h264")
+        await self._send_subscribe(
+            stream_id=uid,
+            ssrc_id=ssrc_id,
+            codec="h264",
+            stream_type=stream_type,
+        )
 
-    async def _register_existing_video_streams(self, payload: Any) -> None:
-        """Subscribe to any already-published video streams present in join payload."""
-        streams = self._find_existing_video_streams(payload)
-        if streams:
-            LOGGER.debug(
-                "Agora join_v3: found %d existing video streams in join payload",
-                len(streams),
-            )
+    async def _register_existing_streams(self, payload: Any) -> None:
+        """Subscribe to already-published streams present in the join payload."""
+        streams = self._find_existing_streams(payload)
+        for stream_type in ("audio", "video"):
+            if streams[stream_type]:
+                LOGGER.debug(
+                    "Agora join_v3: found %d existing %s streams in join payload",
+                    len(streams[stream_type]),
+                    stream_type,
+                )
 
-        for uid, ssrc_id in streams:
-            self._video_streams.setdefault(uid, {"ssrcId": ssrc_id})
-            await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
+            for uid, ssrc_id, rtx_ssrc_id in streams[stream_type]:
+                self._remember_stream(
+                    uid=uid,
+                    ssrc_id=ssrc_id,
+                    stream_type=stream_type,
+                    rtx_ssrc_id=rtx_ssrc_id,
+                )
+                await self._subscribe_stream(
+                    uid=uid,
+                    ssrc_id=ssrc_id,
+                    stream_type=stream_type,
+                )
 
     @classmethod
-    def _find_existing_video_streams(cls, payload: Any) -> list[tuple[int, int]]:
-        """Walk a join payload and extract existing video stream descriptors."""
-        found: list[tuple[int, int]] = []
+    def _find_existing_streams(
+        cls, payload: Any
+    ) -> dict[str, list[tuple[int, int, int | None]]]:
+        """Walk a join payload and extract audio/video stream descriptors."""
+        found: dict[str, list[tuple[int, int, int | None]]] = {
+            "audio": [],
+            "video": [],
+        }
 
         def _visit(node: Any) -> None:
             if isinstance(node, dict):
-                stream = cls._extract_existing_video_stream(node)
-                if stream is not None:
-                    found.append(stream)
+                uid = cls._coerce_int(node.get("uid"))
+                if uid is None:
+                    uid = cls._coerce_int(node.get("stream_id"))
+
+                audio_ssrc = cls._coerce_int(node.get("audio_ssrc"))
+                video_ssrc = cls._coerce_int(node.get("video_ssrc"))
+                rtx_ssrc_id = cls._coerce_int(node.get("rtxSsrcId"))
+                if rtx_ssrc_id is None:
+                    rtx_ssrc_id = cls._coerce_int(node.get("video_rtx"))
+
+                if uid is not None and audio_ssrc is not None:
+                    found["audio"].append((uid, audio_ssrc, None))
+                if uid is not None and video_ssrc is not None:
+                    found["video"].append((uid, video_ssrc, rtx_ssrc_id))
+
+                ssrc_id = cls._coerce_int(node.get("ssrcId"))
+                if uid is not None and ssrc_id is not None:
+                    codec = str(node.get("codec", "")).lower()
+                    if (
+                        node.get("audio") is True
+                        or node.get("stream_type") == "audio"
+                        or node.get("type") == "audio"
+                        or codec in {"audio", "opus"}
+                    ):
+                        found["audio"].append((uid, ssrc_id, None))
+                    elif (
+                        node.get("video") is True
+                        or node.get("stream_type") == "video"
+                        or node.get("type") == "video"
+                        or codec in {"h264", "h265", "vp8", "vp9", "video"}
+                        or rtx_ssrc_id is not None
+                    ):
+                        found["video"].append((uid, ssrc_id, rtx_ssrc_id))
 
                 for value in node.values():
                     _visit(value)
@@ -538,32 +675,51 @@ class AgoraWebSocketHandler:
 
         _visit(payload)
 
-        deduped: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        for stream in found:
-            if stream in seen:
-                continue
-            seen.add(stream)
-            deduped.append(stream)
+        deduped: dict[str, list[tuple[int, int, int | None]]] = {
+            "audio": [],
+            "video": [],
+        }
+        seen: set[tuple[str, int, int]] = set()
+        for stream_type, stream_list in found.items():
+            for uid, ssrc_id, rtx_ssrc_id in stream_list:
+                marker = (stream_type, uid, ssrc_id)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                deduped[stream_type].append((uid, ssrc_id, rtx_ssrc_id))
         return deduped
 
-    @staticmethod
-    def _extract_existing_video_stream(node: dict[str, Any]) -> tuple[int, int] | None:
-        """Extract one existing video stream descriptor when present."""
-        uid = node.get("uid")
-        ssrc_id = node.get("ssrcId")
-        has_video_marker = (
-            node.get("video") is True
-            or node.get("stream_type") == "video"
-            or node.get("type") == "video"
-            or node.get("codec") in {"h264", "h265", "video"}
-            or node.get("rtxSsrcId") is not None
+    def _remember_stream(
+        self,
+        *,
+        uid: int,
+        ssrc_id: int,
+        stream_type: str,
+        rtx_ssrc_id: int | None = None,
+        **extra: Any,
+    ) -> None:
+        """Merge one discovered stream into local state."""
+        stream_data = (
+            self._audio_streams if stream_type == "audio" else self._video_streams
         )
-        if not has_video_marker:
+        stream = stream_data.setdefault(uid, {})
+        stream["ssrcId"] = ssrc_id
+        if rtx_ssrc_id is not None:
+            stream["rtxSsrcId"] = rtx_ssrc_id
+        for key, value in extra.items():
+            if value is not None:
+                stream[key] = value
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        """Coerce Agora numeric fields that may arrive as strings."""
+        if isinstance(value, bool):
             return None
-        if not isinstance(uid, int) or not isinstance(ssrc_id, int):
-            return None
-        return (uid, ssrc_id)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
 
     async def _subscribe_retry_loop(self) -> None:
         """Retry subscribe shortly after join for WHEP-style consumers."""
@@ -574,7 +730,11 @@ class AgoraWebSocketHandler:
                     return
 
                 pending = [
-                    (uid, data.get("ssrcId"))
+                    ("audio", uid, data.get("ssrcId"))
+                    for uid, data in self._audio_streams.items()
+                    if isinstance(data.get("ssrcId"), int)
+                ] + [
+                    ("video", uid, data.get("ssrcId"))
                     for uid, data in self._video_streams.items()
                     if isinstance(data.get("ssrcId"), int)
                 ]
@@ -582,16 +742,21 @@ class AgoraWebSocketHandler:
                     continue
 
                 LOGGER.debug(
-                    "Agora subscribe retry %d/%d: known_streams=%d",
+                    (
+                        "Agora subscribe retry %d/%d: "
+                        "known_audio_streams=%d known_video_streams=%d"
+                    ),
                     attempt + 1,
                     self._subscribe_retry_attempts,
-                    len(pending),
+                    len(self._audio_streams),
+                    len(self._video_streams),
                 )
-                for uid, ssrc_id in pending:
+                for stream_type, uid, ssrc_id in pending:
                     await self._send_subscribe(
                         stream_id=uid,
                         ssrc_id=ssrc_id,
                         codec="h264",
+                        stream_type=stream_type,
                     )
         except asyncio.CancelledError:
             LOGGER.debug("Agora subscribe retry loop cancelled")
@@ -995,6 +1160,13 @@ class AgoraWebSocketHandler:
         """Return websocket connectivity state."""
         return self._connection_state == "CONNECTED"
 
+    @property
+    def has_known_audio_streams(self) -> bool:
+        """Return whether Agora has announced at least one remote audio stream."""
+        return any(
+            isinstance(data.get("ssrcId"), int) for data in self._audio_streams.values()
+        )
+
     async def disconnect(self) -> None:
         """Close websocket and cancel background tasks."""
         tasks_to_wait: list[asyncio.Task[None]] = []
@@ -1028,5 +1200,6 @@ class AgoraWebSocketHandler:
 
         self._joined = False
         self._connection_state = "DISCONNECTED"
+        self._audio_streams.clear()
         self._video_streams.clear()
-        self._subscribed_video_streams.clear()
+        self._subscribed_streams.clear()

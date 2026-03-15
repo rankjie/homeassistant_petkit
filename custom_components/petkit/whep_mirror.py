@@ -60,7 +60,9 @@ class MirrorUpstreamSession:
     agora_handler: AgoraWebSocketHandler
     agora_rtm: AgoraRTMSignaling
     relay: Any
+    audio_ready: asyncio.Event = field(default_factory=asyncio.Event)
     video_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    audio_track: Any | None = None
     video_track: Any | None = None
     refresh_task: asyncio.Task[None] | None = None
     last_error: str | None = None
@@ -129,6 +131,7 @@ class PetkitMirrorRelayManager:
         elif session_id is not None:
             await self.close_downstream(device_id, session_id)
         upstream = await self._ensure_upstream(camera)
+        wants_audio = any(line.startswith("m=audio") for line in offer_sdp.splitlines())
 
         peer_connection = RTCPeerConnection()
         if session_id is None:
@@ -153,10 +156,20 @@ class PetkitMirrorRelayManager:
                     f"petkit rebroadcast close downstream {device_id}",
                 )
 
+        if (
+            wants_audio
+            and upstream.audio_track is None
+            and upstream.agora_handler.has_known_audio_streams
+        ):
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(upstream.audio_ready.wait(), timeout=1.5)
+
         sender = peer_connection.addTrack(
             upstream.relay.subscribe(upstream.video_track)
         )
         self._prefer_h264(peer_connection, sender)
+        if wants_audio and upstream.audio_track is not None:
+            peer_connection.addTrack(upstream.relay.subscribe(upstream.audio_track))
 
         await peer_connection.setRemoteDescription(
             RTCSessionDescription(sdp=offer_sdp, type="offer")
@@ -380,6 +393,9 @@ class PetkitMirrorRelayManager:
                 device_id,
                 track.kind,
             )
+            if track.kind == "audio" and upstream.audio_track is None:
+                upstream.audio_track = track
+                upstream.audio_ready.set()
             if track.kind == "video" and upstream.video_track is None:
                 upstream.video_track = track
                 upstream.video_ready.set()
@@ -391,6 +407,11 @@ class PetkitMirrorRelayManager:
                     device_id,
                     track.kind,
                 )
+                if track.kind == "audio":
+                    if upstream.audio_track is track:
+                        upstream.audio_track = None
+                        upstream.audio_ready.clear()
+                    return
                 self.hass.async_create_background_task(
                     self.close_device(device_id),
                     f"petkit rebroadcast close device {device_id}",
@@ -407,6 +428,7 @@ class PetkitMirrorRelayManager:
                     f"petkit rebroadcast close device {device_id}",
                 )
 
+        peer_connection.addTransceiver("audio", direction="recvonly")
         transceiver = peer_connection.addTransceiver("video", direction="recvonly")
         self._prefer_h264_transceiver(transceiver)
 
@@ -456,6 +478,12 @@ class PetkitMirrorRelayManager:
             RTCSessionDescription(sdp=answer_sdp, type="answer")
         )
         await asyncio.wait_for(upstream.video_ready.wait(), timeout=20)
+        if (
+            upstream.agora_handler.has_known_audio_streams
+            and not upstream.audio_ready.is_set()
+        ):
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(upstream.audio_ready.wait(), timeout=3)
         upstream.refresh_task = self.hass.async_create_background_task(
             self._refresh_tokens(upstream),
             f"petkit rebroadcast refresh tokens {device_id}",

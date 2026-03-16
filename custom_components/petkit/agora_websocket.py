@@ -241,46 +241,55 @@ class AgoraWebSocketHandler:
                         )
                         if join_ortc is None:
                             return None
-                        # Continue briefly to collect stream notifications
-                        # (on_add_audio_stream with pt) before generating SDP.
-                        continue
-
-                    # Once we have the ORTC, check if we collected
-                    # audio stream PTs and can generate the SDP.
-                    if join_ortc is not None:
-                        has_audio_pt = any(
-                            isinstance(d.get("pt"), int)
-                            for d in self._audio_streams.values()
-                        )
-                        if has_audio_pt or message_type not in (
-                            "on_add_audio_stream",
-                            "on_add_video_stream",
-                            "on_user_online",
-                            "on_published_user_list",
-                        ):
-                            answer = self._generate_answer_sdp(
-                                join_ortc, offer_info
-                            )
-                            if answer:
-                                self._joined = True
-                                self._answer_sdp = answer
-                                return answer
-                            return None
+                        # Drain messages briefly to collect on_add_audio_stream
+                        # (carries the real RTP PT) before generating the SDP.
+                        await self._drain_stream_notifications(websocket)
+                        return self._finalize_answer_sdp(join_ortc, offer_info)
 
         except asyncio.TimeoutError:
-            # Timeout may fire while we're collecting stream PTs after
-            # join success — that's fine, generate SDP with what we have.
             if join_ortc is not None:
-                answer = self._generate_answer_sdp(join_ortc, offer_info)
-                if answer:
-                    self._joined = True
-                    self._answer_sdp = answer
-                    return answer
+                return self._finalize_answer_sdp(join_ortc, offer_info)
             LOGGER.error("Timeout waiting for join_v3 response")
         except WebSocketException as err:
             LOGGER.error("WebSocket error while waiting for join response: %s", err)
             self._connection_state = "DISCONNECTED"
 
+        return None
+
+    async def _drain_stream_notifications(
+        self, websocket: ClientConnection
+    ) -> None:
+        """Read messages for a short window to collect stream PTs."""
+        try:
+            async with asyncio.timeout(0.5):
+                async for raw_message in websocket:
+                    try:
+                        response = json.loads(raw_message)
+                    except json.JSONDecodeError:
+                        continue
+                    message_type = response.get("_type", "")
+                    if message_type in self._message_handlers:
+                        await self._message_handlers[message_type](response)
+                    # Stop once we have an audio stream PT.
+                    if any(
+                        isinstance(d.get("pt"), int)
+                        for d in self._audio_streams.values()
+                    ):
+                        return
+        except asyncio.TimeoutError:
+            pass
+
+    def _finalize_answer_sdp(
+        self,
+        ortc: dict[str, Any],
+        offer_info: OfferSdpInfo,
+    ) -> str | None:
+        """Generate the answer SDP and mark join as complete."""
+        answer_sdp = self._generate_answer_sdp(ortc, offer_info)
+        if answer_sdp:
+            self._joined = True
+            self._answer_sdp = answer_sdp
+            return answer_sdp
         return None
 
     async def _message_loop(self, websocket: ClientConnection) -> None:

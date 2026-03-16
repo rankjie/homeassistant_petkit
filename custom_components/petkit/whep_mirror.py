@@ -545,6 +545,26 @@ class PetkitMirrorRelayManager:
         ):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(upstream.audio_ready.wait(), timeout=3)
+
+        # Log RTP receiver stats to confirm audio packets arrive.
+        await asyncio.sleep(2)
+        try:
+            stats = await peer_connection.getStats()
+            for report in stats.values():
+                if getattr(report, "kind", None) == "audio" and hasattr(
+                    report, "packetsReceived"
+                ):
+                    LOGGER.debug(
+                        "WHEP rebroadcast upstream %s audio RTP stats: "
+                        "packets=%s bytes=%s codec=%s",
+                        device_id,
+                        getattr(report, "packetsReceived", "?"),
+                        getattr(report, "bytesReceived", "?"),
+                        getattr(report, "codecId", "?"),
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
         upstream.refresh_task = self.hass.async_create_background_task(
             self._refresh_tokens(upstream),
             f"petkit rebroadcast refresh tokens {device_id}",

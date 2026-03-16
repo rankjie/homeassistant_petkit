@@ -1047,8 +1047,40 @@ class AgoraWebSocketHandler:
                 extensions = (
                     audio_extensions if media_type == "audio" else video_extensions
                 )
+
+                # Filter answer codecs to those the offer also supports
+                # so we only negotiate codecs both sides can handle.
+                offer_codecs = self._codecs_from_offer_media(media)
+                if codecs and offer_codecs:
+                    offer_names = {
+                        (
+                            (c.get("rtpMap") or {}).get("encodingName", "")
+                            or c.get("name", "")
+                        ).upper()
+                        for c in offer_codecs
+                    }
+                    filtered = [
+                        c
+                        for c in codecs
+                        if (
+                            (c.get("rtpMap") or {}).get("encodingName", "")
+                            or c.get("name", "")
+                        ).upper()
+                        in offer_names
+                    ]
+                    if filtered != codecs:
+                        LOGGER.debug(
+                            "Agora answer SDP codec filter: media=%s "
+                            "ortc=%d offer=%d matched=%d",
+                            media_type,
+                            len(codecs),
+                            len(offer_codecs),
+                            len(filtered),
+                        )
+                    codecs = filtered or codecs
+
                 if not codecs:
-                    codecs = self._codecs_from_offer_media(media)
+                    codecs = offer_codecs or []
                     LOGGER.debug(
                         "Agora answer SDP codec fallback: media=%s mid=%s codecs=%d",
                         media_type,

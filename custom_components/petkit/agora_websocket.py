@@ -218,6 +218,7 @@ class AgoraWebSocketHandler:
         agora_response: AgoraResponse,
     ) -> str | None:
         """Wait for join success / answer after join_v3."""
+        join_ortc: dict[str, Any] | None = None
         try:
             async with asyncio.timeout(15):
                 async for raw_message in websocket:
@@ -233,16 +234,48 @@ class AgoraWebSocketHandler:
                         if isinstance(result, str) and result:
                             return result
 
-                    if response.get("_result") == "success":
-                        answer = await self._handle_join_success(
+                    if response.get("_result") == "success" and join_ortc is None:
+                        join_ortc = await self._prepare_join_ortc(
                             response=response,
-                            offer_info=offer_info,
                             agora_response=agora_response,
                         )
-                        if answer:
-                            return answer
+                        if join_ortc is None:
+                            return None
+                        # Continue briefly to collect stream notifications
+                        # (on_add_audio_stream with pt) before generating SDP.
+                        continue
+
+                    # Once we have the ORTC, check if we collected
+                    # audio stream PTs and can generate the SDP.
+                    if join_ortc is not None:
+                        has_audio_pt = any(
+                            isinstance(d.get("pt"), int)
+                            for d in self._audio_streams.values()
+                        )
+                        if has_audio_pt or message_type not in (
+                            "on_add_audio_stream",
+                            "on_add_video_stream",
+                            "on_user_online",
+                            "on_published_user_list",
+                        ):
+                            answer = self._generate_answer_sdp(
+                                join_ortc, offer_info
+                            )
+                            if answer:
+                                self._joined = True
+                                self._answer_sdp = answer
+                                return answer
+                            return None
 
         except asyncio.TimeoutError:
+            # Timeout may fire while we're collecting stream PTs after
+            # join success — that's fine, generate SDP with what we have.
+            if join_ortc is not None:
+                answer = self._generate_answer_sdp(join_ortc, offer_info)
+                if answer:
+                    self._joined = True
+                    self._answer_sdp = answer
+                    return answer
             LOGGER.error("Timeout waiting for join_v3 response")
         except WebSocketException as err:
             LOGGER.error("WebSocket error while waiting for join response: %s", err)
@@ -323,13 +356,12 @@ class AgoraWebSocketHandler:
         }
         await self._websocket.send(json.dumps(renew_message))
 
-    async def _handle_join_success(
+    async def _prepare_join_ortc(
         self,
         response: dict[str, Any],
-        offer_info: OfferSdpInfo,
         agora_response: AgoraResponse,
-    ) -> str | None:
-        """Handle join_v3 success and generate browser answer SDP."""
+    ) -> dict[str, Any] | None:
+        """Process join_v3 success and return prepared ORTC dict."""
         message = response.get("_message", {})
         ortc = message.get("ortc", {})
         if not ortc:
@@ -375,12 +407,7 @@ class AgoraWebSocketHandler:
             )
             seen.add(fingerprint_value.lower())
 
-        answer_sdp = self._generate_answer_sdp(ortc, offer_info)
-        if answer_sdp:
-            self._joined = True
-            self._answer_sdp = answer_sdp
-            return answer_sdp
-        return None
+        return ortc
 
     async def _handle_answer(self, response: dict[str, Any]) -> str | None:
         """Handle direct `answer` message containing SDP."""
@@ -464,6 +491,7 @@ class AgoraWebSocketHandler:
             cname=message.get("cname"),
             uint_id=self._coerce_int(message.get("uint_id")),
             ortc=message.get("ortc"),
+            pt=self._coerce_int(message.get("pt")),
         )
         await self._subscribe_stream(
             uid=uid,
@@ -1072,6 +1100,32 @@ class AgoraWebSocketHandler:
                             len(filtered),
                         )
                     codecs = filtered or codecs
+
+                # The gateway assigns a dynamic PT per stream that may
+                # differ from the ORTC capability PTs.  Replace the first
+                # codec's PT with the stream-announced PT so the SDP
+                # matches the actual RTP payload type the gateway sends.
+                if codecs and media_type == "audio" and self._audio_streams:
+                    stream_pt = next(
+                        (
+                            d["pt"]
+                            for d in self._audio_streams.values()
+                            if isinstance(d.get("pt"), int)
+                        ),
+                        None,
+                    )
+                    if stream_pt is not None:
+                        first = codecs[0]
+                        if first.get("payloadType") != stream_pt:
+                            LOGGER.debug(
+                                "Agora answer SDP audio PT remap: "
+                                "ORTC PT %s -> stream PT %s",
+                                first.get("payloadType"),
+                                stream_pt,
+                            )
+                            codecs = [
+                                {**first, "payloadType": stream_pt}
+                            ] + codecs[1:]
 
                 if not codecs:
                     codecs = offer_codecs or []

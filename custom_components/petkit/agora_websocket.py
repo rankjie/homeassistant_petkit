@@ -962,6 +962,12 @@ class AgoraWebSocketHandler:
                 len(audio_extensions),
                 len(video_extensions),
             )
+            if audio_codecs:
+                LOGGER.debug(
+                    "Agora ORTC audio codec[0] raw keys=%s data=%s",
+                    sorted(audio_codecs[0].keys()),
+                    audio_codecs[0],
+                )
 
             candidates = ice_parameters.get("candidates", []) or []
             ice_ufrag = ice_parameters.get("iceUfrag") or secrets.token_hex(4)
@@ -1095,10 +1101,24 @@ class AgoraWebSocketHandler:
 
                 for codec in codecs:
                     payload_type = codec.get("payloadType")
-                    rtp_map = codec.get("rtpMap", {})
-                    codec_name = rtp_map.get("encodingName", "")
-                    clock_rate = rtp_map.get("clockRate", 90000)
-                    encoding_parameters = rtp_map.get("encodingParameters")
+                    rtp_map = codec.get("rtpMap") or {}
+                    codec_name = (
+                        rtp_map.get("encodingName")
+                        or codec.get("name")
+                        or codec.get("codec")
+                        or ""
+                    )
+                    clock_rate = (
+                        rtp_map.get("clockRate")
+                        or codec.get("clockRate")
+                        or codec.get("rate")
+                        or (48000 if media_type == "audio" else 90000)
+                    )
+                    encoding_parameters = (
+                        rtp_map.get("encodingParameters")
+                        or codec.get("channels")
+                        or codec.get("encodingParameters")
+                    )
 
                     if encoding_parameters:
                         sdp_lines.append(
@@ -1123,8 +1143,12 @@ class AgoraWebSocketHandler:
                                 f"a=rtcp-fb:{payload_type} {feedback_type}"
                             )
 
-                    fmtp = codec.get("fmtp", {})
-                    parameters = fmtp.get("parameters", {}) if fmtp else {}
+                    fmtp = codec.get("fmtp") or {}
+                    parameters = (
+                        fmtp.get("parameters", {})
+                        if isinstance(fmtp, dict)
+                        else {}
+                    ) or codec.get("parameters") or {}
                     if parameters:
                         parameter_string = ";".join(
                             f"{key}={value}" for key, value in parameters.items()
@@ -1132,6 +1156,7 @@ class AgoraWebSocketHandler:
                         sdp_lines.append(f"a=fmtp:{payload_type} {parameter_string}")
 
             answer_sdp = "\r\n".join(sdp_lines) + "\r\n"
+            LOGGER.debug("Agora generated answer SDP:\n%s", answer_sdp)
             return answer_sdp if self._validate_sdp(answer_sdp) else None
         except (AttributeError, TypeError, ValueError) as err:
             LOGGER.error("Failed to generate answer SDP: %s", err)

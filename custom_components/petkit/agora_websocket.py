@@ -1048,17 +1048,12 @@ class AgoraWebSocketHandler:
                     audio_extensions if media_type == "audio" else video_extensions
                 )
 
-                # Filter answer codecs to those the offer also supports
-                # so we only negotiate codecs both sides can handle.
-                offer_codecs = self._codecs_from_offer_media(media)
-                if codecs and offer_codecs:
-                    offer_names = {
-                        (
-                            (c.get("rtpMap") or {}).get("encodingName", "")
-                            or c.get("name", "")
-                        ).upper()
-                        for c in offer_codecs
-                    }
+                # Filter answer codecs to those aiortc can decode.
+                # aiortc supports opus, PCMU, PCMA for audio; static PTs
+                # (0/PCMU, 8/PCMA) may lack a=rtpmap in the offer so we
+                # use a known-good set rather than parsing the offer only.
+                _AIORTC_AUDIO = {"OPUS", "PCMU", "PCMA"}
+                if codecs and media_type == "audio":
                     filtered = [
                         c
                         for c in codecs
@@ -1066,15 +1061,14 @@ class AgoraWebSocketHandler:
                             (c.get("rtpMap") or {}).get("encodingName", "")
                             or c.get("name", "")
                         ).upper()
-                        in offer_names
+                        in _AIORTC_AUDIO
                     ]
                     if filtered != codecs:
+                        removed = len(codecs) - len(filtered)
                         LOGGER.debug(
-                            "Agora answer SDP codec filter: media=%s "
-                            "ortc=%d offer=%d matched=%d",
-                            media_type,
-                            len(codecs),
-                            len(offer_codecs),
+                            "Agora answer SDP codec filter: removed %d "
+                            "unsupported audio codecs, keeping %d",
+                            removed,
                             len(filtered),
                         )
                     codecs = filtered or codecs

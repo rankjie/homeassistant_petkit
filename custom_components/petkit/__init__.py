@@ -110,6 +110,7 @@ async def async_setup_entry(
             region=entry.data.get(CONF_REGION, country_from_ha),
             timezone=entry.data.get(CONF_TIME_ZONE, tz_from_ha),
             session=async_get_clientsession(hass),
+            enable_dbg=True,
         ),
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,

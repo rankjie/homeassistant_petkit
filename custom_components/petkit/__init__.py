@@ -42,6 +42,10 @@ from .whep_mirror import (
     PetkitWhepMirrorView,
     async_cleanup_whep_mirror_sessions,
 )
+from .whep_proxy import (
+    PetkitDirectWhepProxyView,
+    async_cleanup_whep_proxy_sessions,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -72,6 +76,7 @@ async def async_setup_entry(
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitInternalWhepMirrorView())
     hass.http.register_view(PetkitWhepMirrorView())
+    hass.http.register_view(PetkitDirectWhepProxyView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone
@@ -156,6 +161,7 @@ async def async_unload_entry(
         await mqtt_listener.async_stop()
 
     await async_cleanup_whep_mirror_sessions(hass)
+    await async_cleanup_whep_proxy_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 

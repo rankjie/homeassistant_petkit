@@ -44,6 +44,7 @@ from .whep_mirror import (
 )
 from .whep_proxy import (
     PetkitDirectWhepProxyView,
+    PetkitDirectWhepProxySessionView,
     async_cleanup_whep_proxy_sessions,
 )
 
@@ -77,6 +78,7 @@ async def async_setup_entry(
     hass.http.register_view(PetkitInternalWhepMirrorView())
     hass.http.register_view(PetkitWhepMirrorView())
     hass.http.register_view(PetkitDirectWhepProxyView())
+    hass.http.register_view(PetkitDirectWhepProxySessionView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone

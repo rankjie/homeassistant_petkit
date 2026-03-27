@@ -9,6 +9,7 @@ import secrets
 from typing import TYPE_CHECKING
 
 from aiohttp import web
+from sdp_transform import parse as sdp_parse
 from webrtc_models import RTCIceCandidateInit
 
 from homeassistant.components.http import HomeAssistantView
@@ -32,6 +33,7 @@ class DirectWhepSession:
     agora_handler: AgoraWebSocketHandler
     agora_rtm: AgoraRTMSignaling
     refresh_task: asyncio.Task[None] | None = None
+    location_path: str = ""
 
 
 class PetkitDirectWhepProxyManager:
@@ -121,6 +123,7 @@ class PetkitDirectWhepProxyManager:
             camera=camera,
             agora_handler=agora_handler,
             agora_rtm=agora_rtm,
+            location_path=f"/api/petkit/whep_direct/{device_id}/{session_id}",
         )
         session.refresh_task = self.hass.async_create_background_task(
             self._refresh_tokens(session),
@@ -152,6 +155,31 @@ class PetkitDirectWhepProxyManager:
         )
         return True
 
+    async def add_session_candidates(
+        self,
+        device_id: str,
+        session_id: str,
+        sdp_fragment: str,
+    ) -> bool:
+        """Collect trickled ICE candidates for observability / future Agora support."""
+        async with self._lock:
+            session = self._sessions.get(device_id)
+        if session is None or session.session_id != session_id:
+            return False
+
+        added = 0
+        for candidate in _parse_trickle_candidates(sdp_fragment):
+            session.agora_handler.add_ice_candidate(candidate)
+            added += 1
+
+        if added:
+            LOGGER.debug(
+                "Collected %d external WHEP PATCH candidates for %s",
+                added,
+                device_id,
+            )
+        return True
+
     async def close_all(self) -> None:
         """Close all active direct WHEP sessions."""
         async with self._lock:
@@ -177,6 +205,41 @@ def _get_manager(hass) -> PetkitDirectWhepProxyManager:
         manager = PetkitDirectWhepProxyManager(hass)
         domain_data["whep_proxy_manager"] = manager
     return manager
+
+
+def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
+    """Extract trickled ICE candidates from a WHEP SDP fragment."""
+    try:
+        parsed = sdp_parse(sdp_fragment)
+    except Exception:  # noqa: BLE001
+        return []
+
+    candidates: list[RTCIceCandidateInit] = []
+    for media in parsed.get("media", []) or []:
+        mid = media.get("mid")
+        mline_index = media.get("mLineIndex")
+        for candidate in media.get("candidates", []) or []:
+            foundation = candidate.get("foundation", "0")
+            component = candidate.get("component", 1)
+            transport = candidate.get("transport", "udp")
+            priority = candidate.get("priority", 0)
+            ip = candidate.get("ip", "")
+            port = candidate.get("port", 0)
+            candidate_type = candidate.get("type", "host")
+            candidate_line = (
+                f"candidate:{foundation} {component} {transport} "
+                f"{priority} {ip} {port} typ {candidate_type}"
+            )
+            candidates.append(
+                RTCIceCandidateInit(
+                    candidate=candidate_line,
+                    sdp_mid=str(mid) if mid is not None else None,
+                    sdp_m_line_index=int(mline_index)
+                    if isinstance(mline_index, int)
+                    else None,
+                )
+            )
+    return candidates
 
 
 async def async_cleanup_whep_proxy_sessions(hass) -> None:
@@ -210,7 +273,9 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             return web.Response(status=400, text="Empty SDP offer")
 
         try:
-            _, answer_sdp = await _get_manager(hass).create_session(camera, offer_sdp)
+            session_id, answer_sdp = await _get_manager(hass).create_session(
+                camera, offer_sdp
+            )
         except (OSError, RuntimeError, ValueError) as err:
             LOGGER.error("Direct WHEP proxy failed for %s: %s", device_id, err)
             return web.Response(status=502, text=str(err))
@@ -219,24 +284,35 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             status=201,
             text=answer_sdp,
             content_type="application/sdp",
-            headers={"Location": request.path},
+            headers={"Location": f"{request.path}/{session_id}"},
         )
 
-    async def patch(self, request: web.Request, device_id: str) -> web.Response:
+    async def patch(
+        self,
+        request: web.Request,
+        device_id: str,
+        session_id: str,
+    ) -> web.Response:
         """Accept trickled ICE patches for WHEP compatibility."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
             return auth_error
 
         body = await request.text()
-        if body.strip():
-            LOGGER.debug(
-                "Ignoring external WHEP PATCH candidates for %s in direct proxy PoC",
-                device_id,
-            )
+        if not await _get_manager(request.app["hass"]).add_session_candidates(
+            device_id,
+            session_id,
+            body,
+        ):
+            return web.Response(status=404, text="No active direct WHEP session")
         return web.Response(status=204)
 
-    async def delete(self, request: web.Request, device_id: str) -> web.Response:
+    async def delete(
+        self,
+        request: web.Request,
+        device_id: str,
+        session_id: str,
+    ) -> web.Response:
         """Tear down the active direct WHEP session."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
@@ -246,3 +322,29 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             return web.Response(status=404, text="No active direct WHEP session")
 
         return web.Response(status=200, text="Session closed")
+
+
+class PetkitDirectWhepProxySessionView(HomeAssistantView):
+    """Session-scoped WHEP resource path for PATCH / DELETE."""
+
+    url = "/api/petkit/whep_direct/{device_id}/{session_id}"
+    name = "api:petkit:whep_direct:session"
+    requires_auth = False
+
+    async def patch(
+        self,
+        request: web.Request,
+        device_id: str,
+        session_id: str,
+    ) -> web.Response:
+        """Handle trickled ICE candidates on the session resource."""
+        return await PetkitDirectWhepProxyView().patch(request, device_id, session_id)
+
+    async def delete(
+        self,
+        request: web.Request,
+        device_id: str,
+        session_id: str,
+    ) -> web.Response:
+        """Handle session teardown on the session resource."""
+        return await PetkitDirectWhepProxyView().delete(request, device_id, session_id)

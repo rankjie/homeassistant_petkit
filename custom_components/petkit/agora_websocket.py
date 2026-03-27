@@ -83,6 +83,8 @@ class AgoraWebSocketHandler:
 
         self._joined = False
         self._answer_sdp: str | None = None
+        self._pending_answer_ortc: dict[str, Any] | None = None
+        self._pending_offer_info: OfferSdpInfo | None = None
         self._rtc_token: str | None = None
         self._rtc_token_provider = rtc_token_provider
         self._prefer_instant_video = prefer_instant_video
@@ -244,6 +246,13 @@ class AgoraWebSocketHandler:
                             return answer
 
         except asyncio.TimeoutError:
+            if self._pending_answer_ortc is not None and self._pending_offer_info is not None:
+                LOGGER.warning(
+                    "Timeout waiting for announced video stream; falling back to early SDP answer"
+                )
+                answer = self._finalize_pending_answer()
+                if answer:
+                    return answer
             LOGGER.error("Timeout waiting for join_v3 response")
         except WebSocketException as err:
             LOGGER.error("WebSocket error while waiting for join response: %s", err)
@@ -376,12 +385,16 @@ class AgoraWebSocketHandler:
             )
             seen.add(fingerprint_value.lower())
 
-        answer_sdp = self._generate_answer_sdp(ortc, offer_info)
-        if answer_sdp:
-            self._joined = True
-            self._answer_sdp = answer_sdp
-            return answer_sdp
-        return None
+        self._pending_answer_ortc = ortc
+        self._pending_offer_info = offer_info
+
+        if self._declare_remote_video_ssrc and not any(
+            isinstance(stream.get("ssrcId"), int) for stream in self._video_streams.values()
+        ):
+            LOGGER.debug("Waiting for on_add_video_stream before finalizing SDP answer")
+            return None
+
+        return self._finalize_pending_answer()
 
     async def _handle_answer(self, response: dict[str, Any]) -> str | None:
         """Handle direct `answer` message containing SDP."""
@@ -443,6 +456,27 @@ class AgoraWebSocketHandler:
 
         if isinstance(ssrc_id, int):
             await self._subscribe_video_stream(uid=uid, ssrc_id=ssrc_id)
+            if self._pending_answer_ortc is not None and self._pending_offer_info is not None:
+                return self._finalize_pending_answer()
+
+        return None
+
+    def _finalize_pending_answer(self) -> str | None:
+        """Generate the deferred SDP answer once enough stream metadata exists."""
+        if self._pending_answer_ortc is None or self._pending_offer_info is None:
+            return self._answer_sdp
+
+        answer_sdp = self._generate_answer_sdp(
+            self._pending_answer_ortc,
+            self._pending_offer_info,
+        )
+        if answer_sdp:
+            self._joined = True
+            self._answer_sdp = answer_sdp
+            self._pending_answer_ortc = None
+            self._pending_offer_info = None
+            return answer_sdp
+        return None
 
     async def _send_set_client_role(
         self, role: str = "audience", level: int = 1
@@ -1060,6 +1094,9 @@ class AgoraWebSocketHandler:
             self._websocket = None
 
         self._joined = False
+        self._answer_sdp = None
+        self._pending_answer_ortc = None
+        self._pending_offer_info = None
         self._connection_state = "DISCONNECTED"
         self._video_streams.clear()
         self._subscribed_video_streams.clear()

@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from pypetkitapi import (
     FEEDER_WITH_CAMERA,
@@ -35,7 +34,6 @@ from .agora_websocket import AgoraWebSocketHandler
 from .const import (
     AGORA_APP_ID,
     CONF_STREAM_CONTROL_MODE,
-    DEFAULT_ALWAYS_ON_STREAM,
     DEFAULT_STREAM_CONTROL_MODE,
     DOMAIN,
     LOGGER,
@@ -44,8 +42,6 @@ from .const import (
 )
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
-from .go2rtc_stream import get_go2rtc_stream_manager
-from .rtsp_stream import get_rtsp_stream_manager
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -142,8 +138,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._pending_mirror_browser_candidates: dict[
             str, list[RTCIceCandidateInit]
         ] = {}
-        self._go2rtc_manager = get_go2rtc_stream_manager(hass)
-        self._rtsp_manager = get_rtsp_stream_manager(hass)
 
     @property
     def available(self) -> bool:
@@ -152,53 +146,18 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose rebroadcast URLs when available."""
-        mirror_path = f"/api/petkit/whep_mirror/{self.device.id}"
-        base_url: str | None = None
+        """Expose the stable external direct WHEP URL."""
+        direct_path = f"/api/petkit/whep_direct/{self.device.id}"
         try:
             base_url = get_url(self.hass, prefer_external=False)
         except NoURLAvailableError:
-            mirror_url = mirror_path
+            direct_url = direct_path
         else:
-            mirror_url = f"{base_url.rstrip('/')}{mirror_path}"
+            direct_url = f"{base_url.rstrip('/')}{direct_path}"
 
-        attributes = {
-            "whep_mirror_url": mirror_url,
+        return {
+            "whep_direct_url": direct_url,
         }
-        direct_whep_path = f"/api/petkit/whep_direct/{self.device.id}"
-        if base_url is None:
-            attributes["whep_direct_url"] = direct_whep_path
-        else:
-            attributes["whep_direct_url"] = (
-                f"{base_url.rstrip('/')}{direct_whep_path}"
-            )
-
-        if self._always_on_stream_enabled():
-            internal_source = self._go2rtc_manager.internal_webrtc_source(
-                str(self.device.id)
-            )
-            if internal_source is not None:
-                attributes["whep_internal_url"] = internal_source.removeprefix(
-                    "webrtc:"
-                )
-            device_id = str(self.device.id)
-            rtsp_url = self._rtsp_manager.rtsp_url(device_id) or (
-                self._rtsp_manager.planned_rtsp_url(device_id)
-            )
-            attributes["rtsp_passthrough_url"] = rtsp_url
-            rtsp_host = urlsplit(base_url).hostname if base_url else None
-            if rtsp_host:
-                attributes["rtsp_passthrough_external_url"] = (
-                    self._rtsp_manager.planned_rtsp_url_for_host(device_id, rtsp_host)
-                )
-            if self._go2rtc_manager.is_managed_available():
-                go2rtc_url = self._go2rtc_manager.rtsp_url(device_id)
-                attributes["go2rtc_stream_url"] = go2rtc_url
-                attributes["stream_source_url"] = go2rtc_url
-            else:
-                attributes["stream_source_url"] = rtsp_url
-
-        return attributes
 
     async def async_added_to_hass(self) -> None:
         """Register ICE callback when entity is added."""
@@ -209,8 +168,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.hass,
             self.get_ice_servers,
         )
-        if self._always_on_stream_enabled():
-            self.hass.async_create_task(self._async_ensure_always_on_listener())
 
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
@@ -220,8 +177,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
 
-        await self._go2rtc_manager.async_remove_stream(str(self.device.id))
-        await self._rtsp_manager.async_close_stream(str(self.device.id))
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -231,17 +186,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if live_feed is None:
             return
         await self._refresh_agora_context(live_feed)
-
-    async def _async_ensure_always_on_listener(self) -> None:
-        """Best-effort background start for the always-on RTSP listener only."""
-        try:
-            await self._rtsp_manager.async_ensure_stream(self)
-        except Exception as err:  # noqa: BLE001
-            LOGGER.debug(
-                "Always-on RTSP listener bootstrap failed for %s: %s",
-                self.device.id,
-                err,
-            )
 
     async def async_camera_image(
         self,
@@ -340,29 +284,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             return None
 
     async def stream_source(self) -> str | None:
-        """Return the rebroadcast RTSP source when the option is enabled."""
-        if not self._always_on_stream_enabled():
-            return f"webrtc://{self.device.sn}"
-
-        rtsp_source = await self._rtsp_manager.async_ensure_stream(self)
-        if rtsp_source is not None:
-            stream_source = await self._go2rtc_manager.async_ensure_stream(
-                str(self.device.id),
-                source=rtsp_source,
-            )
-            if stream_source is not None:
-                return stream_source
-            return rtsp_source
-
-        stream_source = await self._go2rtc_manager.async_ensure_stream(
-            str(self.device.id)
-        )
-        if stream_source is None:
-            LOGGER.debug(
-                "Rebroadcast stream source unavailable for %s",
-                self.device.id,
-            )
-        return stream_source
+        """Return the native WebRTC source identifier for this camera."""
+        return f"webrtc://{self.device.sn}"
 
     async def async_handle_async_webrtc_offer(
         self,
@@ -456,7 +379,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         offer_sdp: str,
         session_id: str,
     ) -> str | None:
-        """Reuse rebroadcast for browsers only when exclusive mode requires it."""
+        """Reuse the internal browser relay only when exclusive mode requires it."""
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
         if AIORTC_IMPORT_ERROR is not None:
@@ -476,14 +399,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 self,
                 offer_sdp,
                 session_id=session_id,
-                kind="browser",
             )
             await self._flush_pending_mirror_candidates(manager, session_id)
         except (OSError, RuntimeError, ValueError) as err:
             self._pending_mirror_browser_sessions.discard(session_id)
             self._pending_mirror_browser_candidates.pop(session_id, None)
             LOGGER.warning(
-                "Rebroadcast browser startup failed for %s, falling back to direct path: %s",
+                "Browser relay startup failed for %s, falling back to direct path: %s",
                 self.device.id,
                 err,
             )
@@ -561,11 +483,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 )
 
     async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
-        """Stop direct browser state and any active rebroadcast session."""
+        """Stop direct browser state and any active browser relay session."""
         self._mirror_browser_sessions.clear()
         self._pending_mirror_browser_sessions.clear()
         self._pending_mirror_browser_candidates.clear()
-        await self._rtsp_manager.async_close_stream(str(self.device.id))
         await self._async_close_direct_stream(send_stop_override)
 
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
@@ -579,13 +500,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             )
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
-                "Rebroadcast cleanup error for %s: %s",
+                "Browser relay cleanup error for %s: %s",
                 self.device.id,
                 err,
             )
 
     async def _async_close_mirror_browser_session(self, session_id: str) -> None:
-        """Close one browser session backed by the rebroadcast path."""
+        """Close one browser session backed by the internal relay path."""
         self._mirror_browser_sessions.discard(session_id)
         self._pending_mirror_browser_sessions.discard(session_id)
         self._pending_mirror_browser_candidates.pop(session_id, None)
@@ -601,7 +522,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             )
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
-                "Rebroadcast browser session cleanup error for %s: %s",
+                "Browser relay session cleanup error for %s: %s",
                 self.device.id,
                 err,
             )
@@ -634,7 +555,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             str(self.device.id)
         ):
             LOGGER.debug(
-                "Manual start_live skipped for %s: rebroadcast already active",
+                "Manual start_live skipped for %s: browser relay already active",
                 self.device.id,
             )
             return True
@@ -673,11 +594,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if mode not in (STREAM_CONTROL_SHARED, STREAM_CONTROL_EXCLUSIVE):
             return DEFAULT_STREAM_CONTROL_MODE
         return mode
-
-    @staticmethod
-    def _always_on_stream_enabled() -> bool:
-        """Return whether the rebroadcast session should stay prewarmed."""
-        return DEFAULT_ALWAYS_ON_STREAM
 
     async def _refresh_rtc_token(self) -> str | None:
         """Fetch fresh live feed tokens and return the latest RTC token."""
@@ -730,11 +646,11 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         return live_feed
 
     async def async_get_live_feed(self) -> LiveFeed | None:
-        """Return the current live feed payload for rebroadcast helpers."""
+        """Return the current live feed payload for browser relay helpers."""
         return await self._get_live_feed()
 
     async def async_refresh_rtc_token(self) -> str | None:
-        """Refresh and return the latest RTC token for rebroadcast helpers."""
+        """Refresh and return the latest RTC token for browser relay helpers."""
         return await self._refresh_rtc_token()
 
     async def _refresh_agora_context(self, live_feed: LiveFeed) -> None:
@@ -799,5 +715,5 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         candidates: list[RTCIceCandidateInit],
         agora_response: AgoraResponse,
     ) -> list[RTCIceCandidateInit]:
-        """Filter Agora ICE candidates for rebroadcast helpers."""
+        """Filter Agora ICE candidates for browser relay helpers."""
         return self._filter_candidates(candidates, agora_response)

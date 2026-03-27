@@ -38,8 +38,6 @@ from .coordinator import (
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
 from .whep_mirror import (
-    PetkitInternalWhepMirrorView,
-    PetkitWhepMirrorView,
     async_cleanup_whep_mirror_sessions,
 )
 from .whep_proxy import (
@@ -75,8 +73,6 @@ async def async_setup_entry(
     """Set up this integration using UI."""
 
     # Register API views once (idempotent — HA deduplicates by name)
-    hass.http.register_view(PetkitInternalWhepMirrorView())
-    hass.http.register_view(PetkitWhepMirrorView())
     hass.http.register_view(PetkitDirectWhepProxyView())
     hass.http.register_view(PetkitDirectWhepProxySessionView())
 

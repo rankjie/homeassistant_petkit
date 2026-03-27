@@ -63,6 +63,8 @@ class AgoraWebSocketHandler:
         prefer_instant_video: bool = False,
         subscribe_retry_delay: float = 0.0,
         subscribe_retry_attempts: int = 0,
+        declare_remote_video_ssrc: bool = False,
+        disable_audio_answer: bool = False,
     ) -> None:
         """Initialize runtime state."""
         self._websocket: ClientConnection | None = None
@@ -86,6 +88,8 @@ class AgoraWebSocketHandler:
         self._prefer_instant_video = prefer_instant_video
         self._subscribe_retry_delay = subscribe_retry_delay
         self._subscribe_retry_attempts = subscribe_retry_attempts
+        self._declare_remote_video_ssrc = declare_remote_video_ssrc
+        self._disable_audio_answer = disable_audio_answer
 
         self._setup_message_handlers()
 
@@ -836,6 +840,13 @@ class AgoraWebSocketHandler:
                     return "sendrecv"
                 return "inactive"
 
+            primary_video_stream: dict[str, Any] | None = None
+            if self._declare_remote_video_ssrc:
+                for stream in self._video_streams.values():
+                    if isinstance(stream.get("ssrcId"), int):
+                        primary_video_stream = stream
+                        break
+
             media_sections = offer_info.parsed_sdp.get("media", []) or []
             if not media_sections:
                 return None
@@ -864,6 +875,8 @@ class AgoraWebSocketHandler:
                 media_type = media.get("type", "audio")
                 offer_direction = media.get("direction", "sendonly")
                 answer_direction = _answer_direction(offer_direction)
+                if media_type == "audio" and self._disable_audio_answer:
+                    answer_direction = "inactive"
                 mid = str(media.get("mid", str(index)))
 
                 codecs = audio_codecs if media_type == "audio" else video_codecs
@@ -951,6 +964,26 @@ class AgoraWebSocketHandler:
                             f"{key}={value}" for key, value in parameters.items()
                         )
                         sdp_lines.append(f"a=fmtp:{payload_type} {parameter_string}")
+
+                if media_type == "video" and primary_video_stream is not None:
+                    video_ssrc = primary_video_stream.get("ssrcId")
+                    rtx_ssrc = primary_video_stream.get("rtxSsrcId")
+                    cname = primary_video_stream.get("cname") or "agora"
+                    if isinstance(video_ssrc, int):
+                        sdp_lines.extend(
+                            [
+                                "a=msid:agora agora-video",
+                                f"a=ssrc:{video_ssrc} cname:{cname}",
+                                f"a=ssrc:{video_ssrc} msid:agora agora-video",
+                                f"a=ssrc:{video_ssrc} mslabel:agora",
+                                f"a=ssrc:{video_ssrc} label:agora-video",
+                            ]
+                        )
+                        if isinstance(rtx_ssrc, int):
+                            sdp_lines.append(
+                                f"a=ssrc-group:FID {video_ssrc} {rtx_ssrc}"
+                            )
+                            sdp_lines.append(f"a=ssrc:{rtx_ssrc} cname:{cname}")
 
             answer_sdp = "\r\n".join(sdp_lines) + "\r\n"
             return answer_sdp if self._validate_sdp(answer_sdp) else None

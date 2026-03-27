@@ -449,7 +449,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         offer_sdp: str,
         session_id: str,
     ) -> str | None:
-        """Try the rebroadcast path first when it is already in use or enabled."""
+        """Reuse rebroadcast for browsers only when exclusive mode requires it."""
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
         if AIORTC_IMPORT_ERROR is not None:
@@ -457,8 +457,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
         manager = _get_manager(self.hass)
         use_rebroadcast = (
-            self._always_on_stream_enabled()
-            or await manager.has_upstream(str(self.device.id))
+            self._stream_control_mode() == STREAM_CONTROL_EXCLUSIVE
+            and await manager.has_upstream(str(self.device.id))
         )
         if not use_rebroadcast:
             return None

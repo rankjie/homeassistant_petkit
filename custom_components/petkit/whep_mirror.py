@@ -17,6 +17,10 @@ from .agora_api import SERVICE_IDS, AgoraAPIClient
 from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
+from .encoded_passthrough import (
+    ensure_aiortc_decoder_passthrough_patch,
+    replace_track_with_encoded_passthrough,
+)
 from .webrtc_common import (
     _add_offer_candidates,
     _get_live_feed_for_webrtc,
@@ -109,7 +113,7 @@ class PetkitMirrorRelayManager:
     ) -> tuple[str, str]:
         """Create or reuse an upstream ingest, then answer one downstream offer."""
         device_id = str(camera.device.id)
-        if kind == "whep":
+        if kind in {"whep", "internal"}:
             await self.close_downstreams_by_kind(device_id, kind)
         elif session_id is not None:
             await self.close_downstream(device_id, session_id)
@@ -139,7 +143,9 @@ class PetkitMirrorRelayManager:
                 )
 
         sender = peer_connection.addTrack(
-            upstream.relay.subscribe(upstream.video_track)
+            # Avoid unbounded per-subscriber frame queues when the downstream
+            # encoder or consumer runs slower than the incoming stream.
+            upstream.relay.subscribe(upstream.video_track, buffered=False)
         )
         self._prefer_h264(peer_connection, sender)
 
@@ -310,6 +316,7 @@ class PetkitMirrorRelayManager:
     ) -> MirrorUpstreamSession:
         """Negotiate the upstream aiortc ingest peer against Agora."""
         device_id = str(camera.device.id)
+        ensure_aiortc_decoder_passthrough_patch()
 
         live_feed = await _get_live_feed_for_webrtc(camera)
         if live_feed is None:
@@ -360,8 +367,14 @@ class PetkitMirrorRelayManager:
                 track.kind,
             )
             if track.kind == "video" and upstream.video_track is None:
-                upstream.video_track = track
-                upstream.video_ready.set()
+                packet_track = replace_track_with_encoded_passthrough(
+                    peer_connection,
+                    track,
+                    on_started=upstream.video_ready.set,
+                )
+                upstream.video_track = packet_track or track
+                if packet_track is None:
+                    upstream.video_ready.set()
 
             @track.on("ended")
             async def on_ended() -> None:

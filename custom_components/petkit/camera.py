@@ -44,6 +44,7 @@ from .const import (
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
 from .go2rtc_stream import get_go2rtc_stream_manager
+from .rtsp_stream import get_rtsp_stream_manager
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -141,6 +142,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             str, list[RTCIceCandidateInit]
         ] = {}
         self._go2rtc_manager = get_go2rtc_stream_manager(hass)
+        self._rtsp_manager = get_rtsp_stream_manager(hass)
 
     @property
     def available(self) -> bool:
@@ -170,10 +172,17 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 attributes["whep_internal_url"] = internal_source.removeprefix(
                     "webrtc:"
                 )
-            if self._go2rtc_manager.is_managed_available():
-                attributes["stream_source_url"] = self._go2rtc_manager.rtsp_url(
-                    str(self.device.id)
-                )
+            rtsp_url = self._rtsp_manager.rtsp_url(str(self.device.id))
+            if rtsp_url is not None:
+                attributes["rtsp_passthrough_url"] = rtsp_url
+                if self._go2rtc_manager.is_managed_available():
+                    go2rtc_url = self._go2rtc_manager.rtsp_url(
+                        str(self.device.id)
+                    )
+                    attributes["go2rtc_stream_url"] = go2rtc_url
+                    attributes["stream_source_url"] = go2rtc_url
+                else:
+                    attributes["stream_source_url"] = rtsp_url
 
         return attributes
 
@@ -196,6 +205,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
 
         await self._go2rtc_manager.async_remove_stream(str(self.device.id))
+        await self._rtsp_manager.async_close_stream(str(self.device.id))
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -306,6 +316,16 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         """Return the rebroadcast RTSP source when the option is enabled."""
         if not self._always_on_stream_enabled():
             return f"webrtc://{self.device.sn}"
+
+        rtsp_source = await self._rtsp_manager.async_ensure_stream(self)
+        if rtsp_source is not None:
+            stream_source = await self._go2rtc_manager.async_ensure_stream(
+                str(self.device.id),
+                source=rtsp_source,
+            )
+            if stream_source is not None:
+                return stream_source
+            return rtsp_source
 
         stream_source = await self._go2rtc_manager.async_ensure_stream(
             str(self.device.id)
@@ -518,6 +538,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._mirror_browser_sessions.clear()
         self._pending_mirror_browser_sessions.clear()
         self._pending_mirror_browser_candidates.clear()
+        await self._rtsp_manager.async_close_stream(str(self.device.id))
         await self._async_close_direct_stream(send_stop_override)
 
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager

@@ -77,18 +77,23 @@ class PetkitGo2RTCStreamManager:
             f"/api/petkit/whep_internal/{device_id}"
         )
 
-    async def async_ensure_stream(self, device_id: str) -> str | None:
+    async def async_ensure_stream(
+        self,
+        device_id: str,
+        source: str | None = None,
+    ) -> str | None:
         """Ensure the internal go2rtc stream exists and return its RTSP URL."""
         if not self.is_managed_available():
             return None
 
-        source = self.internal_webrtc_source(device_id)
         if source is None:
-            LOGGER.debug(
-                "PetKit rebroadcast stream %s unavailable: internal HA HTTP endpoint unsupported",
-                device_id,
-            )
-            return None
+            source = self.internal_webrtc_source(device_id)
+            if source is None:
+                LOGGER.debug(
+                    "PetKit rebroadcast stream %s unavailable: internal HA HTTP endpoint unsupported",
+                    device_id,
+                )
+                return None
 
         stream_name = self.stream_name(device_id)
         lock = self._locks.setdefault(stream_name, asyncio.Lock())

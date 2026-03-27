@@ -165,6 +165,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         attributes = {
             "whep_mirror_url": mirror_url,
         }
+        direct_whep_path = f"/api/petkit/whep_direct/{self.device.id}"
+        if base_url is None:
+            attributes["whep_direct_url"] = direct_whep_path
+        else:
+            attributes["whep_direct_url"] = (
+                f"{base_url.rstrip('/')}{direct_whep_path}"
+            )
 
         if self._always_on_stream_enabled():
             internal_source = self._go2rtc_manager.internal_webrtc_source(

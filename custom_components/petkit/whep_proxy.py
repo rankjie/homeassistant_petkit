@@ -75,6 +75,8 @@ class PetkitDirectWhepProxyManager:
             prefer_instant_video=True,
             subscribe_retry_delay=1.0,
             subscribe_retry_attempts=3,
+            declare_remote_video_ssrc=True,
+            disable_audio_answer=True,
         )
         for line in offer_sdp.splitlines():
             stripped = line.strip()

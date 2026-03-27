@@ -204,6 +204,10 @@ class PetkitRTSPStreamManager:
             return None
         return session.rtsp_url
 
+    def planned_rtsp_url(self, device_id: str) -> str:
+        """Return the deterministic loopback RTSP URL for one device."""
+        return f"rtsp://{_LOCALHOST}:{self._preferred_port(device_id)}/{device_id}"
+
     def rtsp_url_for_host(self, device_id: str, host: str) -> str | None:
         """Return a reachable RTSP URL for the provided host."""
         session = self._sessions.get(device_id)
@@ -211,6 +215,11 @@ class PetkitRTSPStreamManager:
             return None
         formatted_host = self._format_host(host)
         return f"rtsp://{formatted_host}:{session.port}/{device_id}"
+
+    def planned_rtsp_url_for_host(self, device_id: str, host: str) -> str:
+        """Return the deterministic RTSP URL for one device and host."""
+        formatted_host = self._format_host(host)
+        return f"rtsp://{formatted_host}:{self._preferred_port(device_id)}/{device_id}"
 
     async def async_close_stream(self, device_id: str) -> bool:
         """Stop one local RTSP server."""

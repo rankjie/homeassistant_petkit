@@ -70,7 +70,12 @@ class PetkitDirectWhepProxyManager:
             await agora_rtm.update_tokens(refreshed_live_feed)
             return refreshed_live_feed.rtc_token
 
-        agora_handler = AgoraWebSocketHandler(rtc_token_provider=refresh_rtc_token)
+        agora_handler = AgoraWebSocketHandler(
+            rtc_token_provider=refresh_rtc_token,
+            prefer_instant_video=True,
+            subscribe_retry_delay=1.0,
+            subscribe_retry_attempts=3,
+        )
         for line in offer_sdp.splitlines():
             stripped = line.strip()
             if stripped.startswith("a=candidate:"):

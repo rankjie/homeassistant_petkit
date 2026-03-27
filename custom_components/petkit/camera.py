@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pypetkitapi import (
     FEEDER_WITH_CAMERA,
@@ -154,6 +155,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     def extra_state_attributes(self) -> dict[str, str]:
         """Expose rebroadcast URLs when available."""
         mirror_path = f"/api/petkit/whep_mirror/{self.device.id}"
+        base_url: str | None = None
         try:
             base_url = get_url(self.hass, prefer_external=False)
         except NoURLAvailableError:
@@ -176,6 +178,16 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             rtsp_url = self._rtsp_manager.rtsp_url(str(self.device.id))
             if rtsp_url is not None:
                 attributes["rtsp_passthrough_url"] = rtsp_url
+                rtsp_host = urlsplit(base_url).hostname if base_url else None
+                if rtsp_host:
+                    external_rtsp_url = self._rtsp_manager.rtsp_url_for_host(
+                        str(self.device.id),
+                        rtsp_host,
+                    )
+                    if external_rtsp_url is not None:
+                        attributes["rtsp_passthrough_external_url"] = (
+                            external_rtsp_url
+                        )
                 if self._go2rtc_manager.is_managed_available():
                     go2rtc_url = self._go2rtc_manager.rtsp_url(
                         str(self.device.id)

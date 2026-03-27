@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import random
 import secrets
 from typing import TYPE_CHECKING, Any
+import zlib
 
 from av import Packet
 from aiortc.codecs.h264 import H264Encoder
@@ -24,6 +25,10 @@ _OPTIONS_PUBLIC = (
     "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
 )
 _INTERLEAVED_DEFAULT = (0, 1)
+_LISTEN_HOST = "0.0.0.0"
+_LOCALHOST = "127.0.0.1"
+_PORT_RANGE_START = 19000
+_PORT_RANGE_SIZE = 20000
 
 
 def _split_rtsp_request(data: bytes) -> tuple[str, dict[str, str], bytes]:
@@ -153,7 +158,7 @@ class RtspServerSession:
 
     @property
     def rtsp_url(self) -> str:
-        return f"rtsp://127.0.0.1:{self.port}/{self.device_id}"
+        return f"rtsp://{_LOCALHOST}:{self.port}/{self.device_id}"
 
 
 class PetkitRTSPStreamManager:
@@ -175,21 +180,14 @@ class PetkitRTSPStreamManager:
             if existing is not None and existing.server.is_serving():
                 return existing.rtsp_url
 
-            server = await asyncio.start_server(
-                lambda reader, writer: self._handle_client(camera, reader, writer),
-                host="127.0.0.1",
-                port=0,
-            )
-            sock = next(iter(server.sockets or []), None)
-            if sock is None:
-                server.close()
-                await server.wait_closed()
+            server, port = await self._async_start_server(camera)
+            if server is None or port is None:
                 return None
 
             session = RtspServerSession(
                 camera=camera,
                 server=server,
-                port=int(sock.getsockname()[1]),
+                port=port,
             )
             self._sessions[device_id] = session
             LOGGER.debug(
@@ -205,6 +203,14 @@ class PetkitRTSPStreamManager:
         if session is None or not session.server.is_serving():
             return None
         return session.rtsp_url
+
+    def rtsp_url_for_host(self, device_id: str, host: str) -> str | None:
+        """Return a reachable RTSP URL for the provided host."""
+        session = self._sessions.get(device_id)
+        if session is None or not session.server.is_serving():
+            return None
+        formatted_host = self._format_host(host)
+        return f"rtsp://{formatted_host}:{session.port}/{device_id}"
 
     async def async_close_stream(self, device_id: str) -> bool:
         """Stop one local RTSP server."""
@@ -224,6 +230,39 @@ class PetkitRTSPStreamManager:
                 await client.writer.wait_closed()
         LOGGER.debug("Stopped local RTSP passthrough server for %s", device_id)
         return True
+
+    async def _async_start_server(
+        self,
+        camera: PetkitWebRTCCamera,
+    ) -> tuple[asyncio.AbstractServer | None, int | None]:
+        """Start a deterministic RTSP listener for one camera."""
+        used_ports = {session.port for session in self._sessions.values()}
+        preferred_port = self._preferred_port(str(camera.device.id))
+        last_error: OSError | None = None
+
+        for offset in range(_PORT_RANGE_SIZE):
+            port = _PORT_RANGE_START + (
+                (preferred_port - _PORT_RANGE_START + offset) % _PORT_RANGE_SIZE
+            )
+            if port in used_ports:
+                continue
+            try:
+                server = await asyncio.start_server(
+                    lambda reader, writer: self._handle_client(camera, reader, writer),
+                    host=_LISTEN_HOST,
+                    port=port,
+                )
+            except OSError as err:
+                last_error = err
+                continue
+            return server, port
+
+        LOGGER.warning(
+            "Failed to start local RTSP passthrough server for %s: %s",
+            camera.device.id,
+            last_error,
+        )
+        return None, None
 
     async def _handle_client(
         self,
@@ -492,6 +531,18 @@ class PetkitRTSPStreamManager:
             ]
         )
         return sdp.encode()
+
+    @staticmethod
+    def _preferred_port(device_id: str) -> int:
+        """Return the deterministic RTSP port for one device."""
+        return _PORT_RANGE_START + (zlib.crc32(device_id.encode()) % _PORT_RANGE_SIZE)
+
+    @staticmethod
+    def _format_host(host: str) -> str:
+        """Format IPv4/IPv6 hostnames for RTSP URLs."""
+        if ":" in host and not host.startswith("["):
+            return f"[{host}]"
+        return host
 
 
 def get_rtsp_stream_manager(hass) -> PetkitRTSPStreamManager:

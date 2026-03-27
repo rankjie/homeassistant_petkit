@@ -695,7 +695,7 @@ class _BasePetkitWhepMirrorView(HomeAssistantView):
 
 
 class PetkitWhepMirrorView(_BasePetkitWhepMirrorView):
-    """Public WHEP endpoint for external rebroadcast consumers."""
+    """Public compatibility endpoint for external WHEP consumers."""
 
     url = "/api/petkit/whep_mirror/{device_id}"
     name = "api:petkit:whep_mirror"
@@ -706,12 +706,23 @@ class PetkitWhepMirrorView(_BasePetkitWhepMirrorView):
         return _check_external_auth(request)
 
     async def post(self, request: web.Request, device_id: str) -> web.Response:
-        """Receive SDP offer, relay via an internal aiortc peer, return answer."""
-        return await self._post_impl(request, device_id)
+        """Route legacy external clients through the direct signaling path."""
+        from .whep_proxy import PetkitDirectWhepProxyView
+
+        return await PetkitDirectWhepProxyView().post(request, device_id)
 
     async def delete(self, request: web.Request, device_id: str) -> web.Response:
-        """Tear down an active rebroadcast session."""
-        return await self._delete_impl(request, device_id)
+        """Close the active direct legacy session for this device."""
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+
+        from .whep_proxy import _get_manager as _get_proxy_manager
+
+        if not await _get_proxy_manager(request.app["hass"]).close_session(device_id):
+            return web.Response(status=404, text="No active direct WHEP session")
+
+        return web.Response(status=200, text="Session closed")
 
 
 class PetkitInternalWhepMirrorView(_BasePetkitWhepMirrorView):

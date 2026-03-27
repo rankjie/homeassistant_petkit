@@ -237,6 +237,7 @@ class PetkitRTSPStreamManager:
             client.writer.close()
             with contextlib.suppress(Exception):
                 await client.writer.wait_closed()
+        await _get_whep_manager(self.hass).maybe_close_idle_upstream(device_id)
         LOGGER.debug("Stopped local RTSP passthrough server for %s", device_id)
         return True
 
@@ -287,6 +288,8 @@ class PetkitRTSPStreamManager:
         cached_sps: bytes | None = None
         cached_pps: bytes | None = None
         request_uri = "/"
+        upstream = None
+        encoder: H264Encoder | None = None
 
         def _set_cached(kind: str, value: bytes | None) -> None:
             nonlocal cached_sps, cached_pps
@@ -298,8 +301,6 @@ class PetkitRTSPStreamManager:
                 cached_pps = value
 
         try:
-            upstream = await _get_whep_manager(self.hass)._ensure_upstream(camera)
-            encoder = H264Encoder()
             while not reader.at_eof():
                 request = await self._read_rtsp_request(reader)
                 if request is None:
@@ -357,6 +358,12 @@ class PetkitRTSPStreamManager:
                     )
                 elif method == "PLAY":
                     if client.play_task is None:
+                        if upstream is None:
+                            upstream = await _get_whep_manager(
+                                self.hass
+                            )._ensure_upstream(camera)
+                        if encoder is None:
+                            encoder = H264Encoder()
                         relay_track = upstream.relay.subscribe(
                             upstream.video_track,
                             buffered=False,
@@ -427,6 +434,10 @@ class PetkitRTSPStreamManager:
                 client.play_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await client.play_task
+            if session is not None and not session.clients:
+                await _get_whep_manager(self.hass).maybe_close_idle_upstream(
+                    str(camera.device.id)
+                )
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()

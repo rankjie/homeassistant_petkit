@@ -203,7 +203,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.get_ice_servers,
         )
         if self._always_on_stream_enabled():
-            self.hass.async_create_task(self._async_ensure_always_on_stream())
+            self.hass.async_create_task(self._async_ensure_always_on_listener())
 
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
@@ -225,13 +225,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             return
         await self._refresh_agora_context(live_feed)
 
-    async def _async_ensure_always_on_stream(self) -> None:
-        """Best-effort background start for the always-on rebroadcast path."""
+    async def _async_ensure_always_on_listener(self) -> None:
+        """Best-effort background start for the always-on RTSP listener only."""
         try:
-            await self.stream_source()
+            await self._rtsp_manager.async_ensure_stream(self)
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
-                "Always-on stream bootstrap failed for %s: %s",
+                "Always-on RTSP listener bootstrap failed for %s: %s",
                 self.device.id,
                 err,
             )

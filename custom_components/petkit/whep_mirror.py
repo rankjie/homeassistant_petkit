@@ -274,6 +274,12 @@ class PetkitMirrorRelayManager:
             return None
         return upstream.agora_rtm
 
+    async def maybe_close_idle_upstream(self, device_id: str) -> bool:
+        """Close the upstream when no tracked downstreams remain."""
+        had_upstream = await self.has_upstream(device_id)
+        await self._close_upstream_if_unused(device_id)
+        return had_upstream and not await self.has_upstream(device_id)
+
     async def _ensure_upstream(
         self,
         camera: PetkitWebRTCCamera,

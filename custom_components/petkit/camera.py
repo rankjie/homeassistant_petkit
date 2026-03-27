@@ -174,27 +174,22 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 attributes["whep_internal_url"] = internal_source.removeprefix(
                     "webrtc:"
                 )
-            rtsp_url = self._rtsp_manager.rtsp_url(str(self.device.id))
-            if rtsp_url is not None:
-                attributes["rtsp_passthrough_url"] = rtsp_url
-                rtsp_host = urlsplit(base_url).hostname if base_url else None
-                if rtsp_host:
-                    external_rtsp_url = self._rtsp_manager.rtsp_url_for_host(
-                        str(self.device.id),
-                        rtsp_host,
-                    )
-                    if external_rtsp_url is not None:
-                        attributes["rtsp_passthrough_external_url"] = (
-                            external_rtsp_url
-                        )
-                if self._go2rtc_manager.is_managed_available():
-                    go2rtc_url = self._go2rtc_manager.rtsp_url(
-                        str(self.device.id)
-                    )
-                    attributes["go2rtc_stream_url"] = go2rtc_url
-                    attributes["stream_source_url"] = go2rtc_url
-                else:
-                    attributes["stream_source_url"] = rtsp_url
+            device_id = str(self.device.id)
+            rtsp_url = self._rtsp_manager.rtsp_url(device_id) or (
+                self._rtsp_manager.planned_rtsp_url(device_id)
+            )
+            attributes["rtsp_passthrough_url"] = rtsp_url
+            rtsp_host = urlsplit(base_url).hostname if base_url else None
+            if rtsp_host:
+                attributes["rtsp_passthrough_external_url"] = (
+                    self._rtsp_manager.planned_rtsp_url_for_host(device_id, rtsp_host)
+                )
+            if self._go2rtc_manager.is_managed_available():
+                go2rtc_url = self._go2rtc_manager.rtsp_url(device_id)
+                attributes["go2rtc_stream_url"] = go2rtc_url
+                attributes["stream_source_url"] = go2rtc_url
+            else:
+                attributes["stream_source_url"] = rtsp_url
 
         return attributes
 
@@ -207,6 +202,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.hass,
             self.get_ice_servers,
         )
+        if self._always_on_stream_enabled():
+            self.hass.async_create_task(self._async_ensure_always_on_stream())
 
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
@@ -227,6 +224,17 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if live_feed is None:
             return
         await self._refresh_agora_context(live_feed)
+
+    async def _async_ensure_always_on_stream(self) -> None:
+        """Best-effort background start for the always-on rebroadcast path."""
+        try:
+            await self.stream_source()
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "Always-on stream bootstrap failed for %s: %s",
+                self.device.id,
+                err,
+            )
 
     async def async_camera_image(
         self,

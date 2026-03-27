@@ -5,13 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
-import ipaddress
 import secrets
 from typing import TYPE_CHECKING, Any
-
-from aiohttp import web
-
-from homeassistant.components.http import HomeAssistantView
 
 from .agora_api import SERVICE_IDS, AgoraAPIClient
 from .agora_rtm import AgoraRTMSignaling
@@ -52,9 +47,6 @@ else:
 if TYPE_CHECKING:
     from .camera import PetkitWebRTCCamera
 
-TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
-
-
 @dataclass
 class MirrorUpstreamSession:
     """One internal WebRTC ingest from Agora."""
@@ -88,7 +80,6 @@ class MirrorDownstreamSession:
     """One downstream consumer served by the relay."""
 
     session_id: str
-    kind: str
     peer_connection: Any
 
 
@@ -96,7 +87,7 @@ class PetkitMirrorRelayManager:
     """Manage internal upstream and downstream relay peers."""
 
     def __init__(self, hass) -> None:
-        """Initialize rebroadcast session bookkeeping."""
+        """Initialize browser relay session bookkeeping."""
         self.hass = hass
         self._lock = asyncio.Lock()
         self._upstreams: dict[str, MirrorUpstreamSession] = {}
@@ -109,13 +100,10 @@ class PetkitMirrorRelayManager:
         offer_sdp: str,
         *,
         session_id: str | None = None,
-        kind: str = "whep",
     ) -> tuple[str, str]:
         """Create or reuse an upstream ingest, then answer one downstream offer."""
         device_id = str(camera.device.id)
-        if kind in {"whep", "internal"}:
-            await self.close_downstreams_by_kind(device_id, kind)
-        elif session_id is not None:
+        if session_id is not None:
             await self.close_downstream(device_id, session_id)
         upstream = await self._ensure_upstream(camera)
 
@@ -124,7 +112,6 @@ class PetkitMirrorRelayManager:
             session_id = secrets.token_hex(16)
         downstream = MirrorDownstreamSession(
             session_id=session_id,
-            kind=kind,
             peer_connection=peer_connection,
         )
 
@@ -132,14 +119,14 @@ class PetkitMirrorRelayManager:
         async def on_connectionstatechange() -> None:
             state = peer_connection.connectionState
             LOGGER.debug(
-                "WHEP rebroadcast downstream %s state=%s",
+                "Browser relay downstream %s state=%s",
                 device_id,
                 state,
             )
             if state in {"failed", "closed"}:
                 self.hass.async_create_background_task(
                     self._handle_downstream_closed(device_id, session_id),
-                    f"petkit rebroadcast close downstream {device_id}",
+                    f"petkit browser relay close downstream {device_id}",
                 )
 
         sender = peer_connection.addTrack(
@@ -213,23 +200,6 @@ class PetkitMirrorRelayManager:
         if not has_remaining:
             await self._close_upstream_if_unused(device_id)
         return True
-
-    async def close_downstreams_by_kind(self, device_id: str, kind: str) -> bool:
-        """Close downstream sessions matching kind and upstream if none remain."""
-        async with self._lock:
-            sessions = self._downstreams.get(device_id, {})
-            matching_ids = [
-                session_id
-                for session_id, session in sessions.items()
-                if session.kind == kind
-            ]
-
-        closed_any = False
-        for session_id in matching_ids:
-            closed_any = (
-                await self.close_downstream(device_id, session_id) or closed_any
-            )
-        return closed_any
 
     async def add_downstream_candidate(
         self,
@@ -368,7 +338,7 @@ class PetkitMirrorRelayManager:
         @peer_connection.on("track")
         def on_track(track: Any) -> None:
             LOGGER.debug(
-                "WHEP rebroadcast upstream %s track kind=%s",
+                "Browser relay upstream %s track kind=%s",
                 device_id,
                 track.kind,
             )
@@ -385,24 +355,24 @@ class PetkitMirrorRelayManager:
             @track.on("ended")
             async def on_ended() -> None:
                 LOGGER.debug(
-                    "WHEP rebroadcast upstream %s track ended kind=%s",
+                    "Browser relay upstream %s track ended kind=%s",
                     device_id,
                     track.kind,
                 )
                 self.hass.async_create_background_task(
                     self.close_device(device_id),
-                    f"petkit rebroadcast close device {device_id}",
+                    f"petkit browser relay close device {device_id}",
                 )
 
         @peer_connection.on("connectionstatechange")
         async def on_connectionstatechange() -> None:
             state = peer_connection.connectionState
-            LOGGER.debug("WHEP rebroadcast upstream %s state=%s", device_id, state)
+            LOGGER.debug("Browser relay upstream %s state=%s", device_id, state)
             if state in {"failed", "closed"}:
                 upstream.last_error = f"upstream connection state={state}"
                 self.hass.async_create_background_task(
                     self.close_device(device_id),
-                    f"petkit rebroadcast close device {device_id}",
+                    f"petkit browser relay close device {device_id}",
                 )
 
         transceiver = peer_connection.addTransceiver("video", direction="recvonly")
@@ -421,7 +391,7 @@ class PetkitMirrorRelayManager:
             agora_response,
         )
         LOGGER.debug(
-            "WHEP rebroadcast upstream %s candidates=%d filtered=%d",
+            "Browser relay upstream %s candidates=%d filtered=%d",
             device_id,
             parsed_candidates,
             len(upstream.agora_handler.candidates),
@@ -430,7 +400,7 @@ class PetkitMirrorRelayManager:
         rtm_started = await upstream.agora_rtm.start_live(live_feed)
         if not rtm_started:
             LOGGER.debug(
-                "WHEP rebroadcast upstream %s RTM start_live not acknowledged",
+                "Browser relay upstream %s RTM start_live not acknowledged",
                 device_id,
             )
 
@@ -456,7 +426,7 @@ class PetkitMirrorRelayManager:
         await asyncio.wait_for(upstream.video_ready.wait(), timeout=20)
         upstream.refresh_task = self.hass.async_create_background_task(
             self._refresh_tokens(upstream),
-            f"petkit rebroadcast refresh tokens {device_id}",
+            f"petkit browser relay refresh tokens {device_id}",
         )
 
         async with self._lock:
@@ -560,7 +530,7 @@ class PetkitMirrorRelayManager:
 
 
 def _get_manager(hass) -> PetkitMirrorRelayManager:
-    """Return the shared rebroadcast manager."""
+    """Return the shared browser relay manager."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     manager = domain_data.get("whep_mirror_manager")
     if manager is None:
@@ -570,176 +540,7 @@ def _get_manager(hass) -> PetkitMirrorRelayManager:
 
 
 async def async_cleanup_whep_mirror_sessions(hass) -> None:
-    """Close all active rebroadcast sessions."""
+    """Close all active browser relay sessions."""
     manager = hass.data.get(DOMAIN, {}).pop("whep_mirror_manager", None)
     if manager is not None:
         await manager.close_all()
-
-
-def _check_external_auth(request: web.Request) -> web.Response | None:
-    """Allow authenticated HA users or explicit access tokens."""
-    hass = request.app["hass"]
-    if request.get("hass_user"):
-        return None
-
-    token = request.query.get("token")
-    if token:
-        if hass.auth.async_validate_access_token(token) is None:
-            return web.Response(status=401, text="Invalid token")
-        return None
-
-    return web.Response(status=401, text="Authentication required")
-
-
-def _is_loopback_request(request: web.Request) -> bool:
-    """Return whether the request originates from localhost."""
-    remote = request.remote
-    if remote:
-        with contextlib.suppress(ValueError):
-            return ipaddress.ip_address(remote).is_loopback
-
-    peername = None
-    if request.transport is not None:
-        peername = request.transport.get_extra_info("peername")
-
-    if isinstance(peername, tuple) and peername:
-        host = peername[0]
-        with contextlib.suppress(ValueError):
-            return ipaddress.ip_address(host).is_loopback
-
-    return False
-
-
-def _check_internal_auth(request: web.Request) -> web.Response | None:
-    """Allow only loopback requests for the internal rebroadcast endpoint."""
-    if _is_loopback_request(request):
-        return None
-    return web.Response(status=403, text="Internal endpoint is loopback-only")
-
-
-class _BasePetkitWhepMirrorView(HomeAssistantView):
-    """Shared WHEP rebroadcast endpoint logic."""
-
-    requires_auth = False
-    _downstream_kind = "whep"
-
-    def _check_auth(self, request: web.Request) -> web.Response | None:
-        """Validate request authentication for this endpoint."""
-        raise NotImplementedError
-
-    async def _post_impl(self, request: web.Request, device_id: str) -> web.Response:
-        """Receive SDP offer, relay via an internal aiortc peer, return answer."""
-        hass = request.app["hass"]
-
-        auth_error = self._check_auth(request)
-        if auth_error is not None:
-            return auth_error
-
-        cameras = hass.data.get(DOMAIN, {}).get("cameras", {})
-        camera = cameras.get(device_id)
-        if camera is None:
-            return web.Response(status=404, text="Camera not found")
-
-        offer_sdp = await request.text()
-        if not offer_sdp or not offer_sdp.strip():
-            return web.Response(status=400, text="Empty SDP offer")
-
-        if AIORTC_IMPORT_ERROR is not None:
-            return web.Response(
-                status=503,
-                text=f"aiortc relay unavailable: {AIORTC_IMPORT_ERROR}",
-            )
-
-        manager = _get_manager(hass)
-
-        try:
-            _, answer_sdp = await manager.create_downstream_offer(
-                camera,
-                offer_sdp,
-                kind=self._downstream_kind,
-            )
-        except asyncio.TimeoutError:
-            LOGGER.error("WHEP rebroadcast timed out for %s", device_id)
-            return web.Response(status=504, text="Timed out waiting for upstream video")
-        except (OSError, RuntimeError, ValueError) as err:
-            LOGGER.error("WHEP rebroadcast failed for %s: %s", device_id, err)
-            return web.Response(status=502, text=str(err))
-
-        response = web.StreamResponse(
-            status=201,
-            headers={
-                "Content-Type": "application/sdp",
-                "Location": request.path,
-            },
-        )
-        await response.prepare(request)
-        await response.write(answer_sdp.encode())
-        await response.write_eof()
-        return response
-
-    async def _delete_impl(self, request: web.Request, device_id: str) -> web.Response:
-        """Tear down an active rebroadcast session."""
-        hass = request.app["hass"]
-
-        auth_error = self._check_auth(request)
-        if auth_error is not None:
-            return auth_error
-
-        manager = _get_manager(hass)
-        if not await manager.close_downstreams_by_kind(
-            device_id, self._downstream_kind
-        ):
-            return web.Response(status=404, text="No active rebroadcast session")
-
-        return web.Response(status=200, text="Session closed")
-
-
-class PetkitWhepMirrorView(_BasePetkitWhepMirrorView):
-    """Public compatibility endpoint for external WHEP consumers."""
-
-    url = "/api/petkit/whep_mirror/{device_id}"
-    name = "api:petkit:whep_mirror"
-    _downstream_kind = "whep"
-
-    def _check_auth(self, request: web.Request) -> web.Response | None:
-        """Allow HA user auth or token query auth."""
-        return _check_external_auth(request)
-
-    async def post(self, request: web.Request, device_id: str) -> web.Response:
-        """Route legacy external clients through the direct signaling path."""
-        from .whep_proxy import PetkitDirectWhepProxyView
-
-        return await PetkitDirectWhepProxyView().post(request, device_id)
-
-    async def delete(self, request: web.Request, device_id: str) -> web.Response:
-        """Close the active direct legacy session for this device."""
-        auth_error = self._check_auth(request)
-        if auth_error is not None:
-            return auth_error
-
-        from .whep_proxy import _get_manager as _get_proxy_manager
-
-        if not await _get_proxy_manager(request.app["hass"]).close_session(device_id):
-            return web.Response(status=404, text="No active direct WHEP session")
-
-        return web.Response(status=200, text="Session closed")
-
-
-class PetkitInternalWhepMirrorView(_BasePetkitWhepMirrorView):
-    """Loopback-only WHEP endpoint for HA-managed internal rebroadcast consumers."""
-
-    url = "/api/petkit/whep_internal/{device_id}"
-    name = "api:petkit:whep_internal"
-    _downstream_kind = "internal"
-
-    def _check_auth(self, request: web.Request) -> web.Response | None:
-        """Allow loopback requests only."""
-        return _check_internal_auth(request)
-
-    async def post(self, request: web.Request, device_id: str) -> web.Response:
-        """Receive SDP offer for an internal consumer."""
-        return await self._post_impl(request, device_id)
-
-    async def delete(self, request: web.Request, device_id: str) -> web.Response:
-        """Tear down an active internal rebroadcast session."""
-        return await self._delete_impl(request, device_id)

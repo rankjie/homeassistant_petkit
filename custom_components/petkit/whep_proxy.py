@@ -17,11 +17,28 @@ from homeassistant.components.http import HomeAssistantView
 from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
-from .whep_mirror import TOKEN_REFRESH_INTERVAL_SECONDS, _check_external_auth
 from .webrtc_common import _get_live_feed_for_webrtc
 
 if TYPE_CHECKING:
     from .camera import PetkitWebRTCCamera
+
+
+TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
+
+
+def _check_external_auth(request: web.Request) -> web.Response | None:
+    """Allow authenticated HA users or explicit access tokens."""
+    hass = request.app["hass"]
+    if request.get("hass_user"):
+        return None
+
+    token = request.query.get("token")
+    if token:
+        if hass.auth.async_validate_access_token(token) is None:
+            return web.Response(status=401, text="Invalid token")
+        return None
+
+    return web.Response(status=401, text="Authentication required")
 
 
 @dataclass
@@ -85,9 +102,8 @@ class PetkitDirectWhepProxyManager:
                     RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
                 )
 
-        # Inline candidates are all we currently proxy to Agora. We accept PATCH
-        # later for WHEP compatibility, but go2rtc should already include enough
-        # ICE candidates in the initial offer for the first PoC.
+        # Inline candidates are forwarded to Agora immediately. Trickle ICE sent
+        # later via PATCH is accepted separately on the session resource.
         agora_handler.candidates = camera.filter_agora_candidates(
             agora_handler.candidates,
             camera._agora_response,
@@ -168,7 +184,7 @@ class PetkitDirectWhepProxyManager:
         session_id: str,
         sdp_fragment: str,
     ) -> bool:
-        """Collect trickled ICE candidates for observability / future Agora support."""
+        """Forward trickled ICE candidates for one active direct WHEP session."""
         async with self._lock:
             session = self._sessions.get(device_id)
         if session is None or session.session_id != session_id:
@@ -300,7 +316,7 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
         device_id: str,
         session_id: str,
     ) -> web.Response:
-        """Accept trickled ICE patches for WHEP compatibility."""
+        """Accept trickled ICE candidates for one direct WHEP session."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
             return auth_error

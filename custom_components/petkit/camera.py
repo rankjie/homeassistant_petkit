@@ -187,11 +187,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self.get_ice_servers,
         )
 
-        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
-
-        if AIORTC_IMPORT_ERROR is None and self._always_on_stream_enabled():
-            _get_manager(self.hass).register_persistent_camera(self)
-
     async def async_will_remove_from_hass(self) -> None:
         """Cleanup callbacks and websocket sessions."""
         if self._remove_ice_servers:
@@ -199,11 +194,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             self._remove_ice_servers = None
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
-
-        from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
-
-        if AIORTC_IMPORT_ERROR is None:
-            _get_manager(self.hass).unregister_persistent_camera(str(self.device.id))
 
         await self._go2rtc_manager.async_remove_stream(str(self.device.id))
         await self._async_close_stream()
@@ -538,7 +528,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         try:
             await _get_manager(self.hass).close_device(
                 str(self.device.id),
-                allow_restart=False,
             )
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(

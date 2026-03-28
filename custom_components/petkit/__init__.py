@@ -37,6 +37,7 @@ from .coordinator import (
 )
 from .data import PetkitData
 from .iot_mqtt import PetkitIotMqttListener
+from .rtsp_proxy import get_rtsp_proxy_manager
 from .whep_mirror import (
     async_cleanup_whep_mirror_sessions,
 )
@@ -161,6 +162,7 @@ async def async_unload_entry(
     if mqtt_listener is not None:
         await mqtt_listener.async_stop()
 
+    await get_rtsp_proxy_manager(hass).async_close_all()
     await async_cleanup_whep_mirror_sessions(hass)
     await async_cleanup_whep_proxy_sessions(hass)
 

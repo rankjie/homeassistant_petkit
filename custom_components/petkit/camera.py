@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pypetkitapi import (
     FEEDER_WITH_CAMERA,
@@ -44,6 +45,7 @@ from .const import (
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
 from .go2rtc_stream import get_go2rtc_stream_manager
+from .rtsp_proxy import get_rtsp_proxy_manager
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -148,17 +150,23 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose the stable external direct WHEP URL."""
-        direct_path = f"/api/petkit/whep_direct/{self.device.id}"
+        """Expose the stable shared RTSP URL for external consumers."""
+        manager = get_rtsp_proxy_manager(self.hass)
+        device_id = str(self.device.id)
         try:
             base_url = get_url(self.hass, prefer_external=False)
         except NoURLAvailableError:
-            direct_url = direct_path
+            rtsp_url = manager.local_rtsp_url(device_id)
         else:
-            direct_url = f"{base_url.rstrip('/')}{direct_path}"
+            host = urlsplit(base_url).hostname
+            rtsp_url = (
+                manager.rtsp_url_for_host(device_id, host)
+                if host
+                else manager.local_rtsp_url(device_id)
+            )
 
         return {
-            "whep_direct_url": direct_url,
+            "rtsp_stream_url": rtsp_url,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -166,6 +174,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         await super().async_added_to_hass()
         self.hass.data.setdefault(DOMAIN, {}).setdefault("cameras", {})
         self.hass.data[DOMAIN]["cameras"][str(self.device.id)] = self
+        await get_rtsp_proxy_manager(self.hass).async_ensure_listener(self)
         self._remove_ice_servers = async_register_ice_servers(
             self.hass,
             self.get_ice_servers,
@@ -179,6 +188,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
 
+        await get_rtsp_proxy_manager(self.hass).async_close_listener(str(self.device.id))
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -287,11 +297,9 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def stream_source(self) -> str | None:
         """Return the preferred source for downstream stream consumers."""
-        go2rtc_source = await get_go2rtc_stream_manager(self.hass).async_ensure_stream(
-            str(self.device.id)
-        )
-        if go2rtc_source is not None:
-            return go2rtc_source
+        go2rtc_manager = get_go2rtc_stream_manager(self.hass)
+        if go2rtc_manager.is_managed_available():
+            return await go2rtc_manager.async_ensure_stream(str(self.device.id))
         return f"webrtc://{self.device.sn}"
 
     async def async_handle_async_webrtc_offer(
@@ -301,7 +309,21 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         send_message: WebRTCSendMessage,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
-        if provider := await self._async_get_go2rtc_provider():
+        go2rtc_manager = get_go2rtc_stream_manager(self.hass)
+        if go2rtc_manager.is_managed_available():
+            provider = await self._async_get_go2rtc_provider()
+            if provider is None:
+                send_message(
+                    WebRTCError(
+                        code="go2rtc_provider_unavailable",
+                        message=(
+                            "HA-managed go2rtc is required for the shared PetKit stream "
+                            "but no compatible WebRTC provider is available"
+                        ),
+                    )
+                )
+                return
+
             self._go2rtc_browser_sessions[session_id] = provider
             try:
                 await provider.async_handle_async_webrtc_offer(

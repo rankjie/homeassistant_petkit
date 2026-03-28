@@ -154,22 +154,23 @@ class PetkitRTSPProxyManager:
     ) -> None:
         """Proxy one RTSP/TCP client connection to HA-managed go2rtc."""
         device_id = str(camera.device.id)
-        manager = get_go2rtc_stream_manager(self.hass)
-        local_rtsp = await manager.async_ensure_stream(device_id, raise_on_failure=True)
-        if local_rtsp is None:
-            raise RuntimeError(
-                f"HA-managed go2rtc stream unavailable for RTSP proxy {device_id}"
-            )
-
-        local_parts = urlsplit(local_rtsp)
-        local_target = urlunsplit(
-            ("rtsp", f"{_LOCALHOST}:{_GO2RTC_RTSP_PORT}", local_parts.path, "", "")
-        )
-
         upstream_reader = upstream_writer = None
         proxy = None
         try:
             self._last_errors.pop(device_id, None)
+            manager = get_go2rtc_stream_manager(self.hass)
+            local_rtsp = await manager.async_ensure_stream(
+                device_id, raise_on_failure=True
+            )
+            if local_rtsp is None:
+                raise RuntimeError(
+                    f"HA-managed go2rtc stream unavailable for RTSP proxy {device_id}"
+                )
+
+            local_parts = urlsplit(local_rtsp)
+            local_target = urlunsplit(
+                ("rtsp", f"{_LOCALHOST}:{_GO2RTC_RTSP_PORT}", local_parts.path, "", "")
+            )
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 _LOCALHOST,
                 _GO2RTC_RTSP_PORT,

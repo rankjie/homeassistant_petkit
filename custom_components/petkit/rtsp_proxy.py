@@ -157,7 +157,8 @@ class PetkitRTSPProxyManager:
         upstream_reader = upstream_writer = None
         proxy = None
         try:
-            self._last_errors.pop(device_id, None)
+            if self._last_errors.pop(device_id, None) is not None:
+                camera.async_write_ha_state()
             manager = get_go2rtc_stream_manager(self.hass)
             local_rtsp = await manager.async_ensure_stream(
                 device_id, raise_on_failure=True
@@ -194,6 +195,7 @@ class PetkitRTSPProxyManager:
             await asyncio.wait(proxy.tasks, return_when=asyncio.FIRST_COMPLETED)
         except Exception as err:  # noqa: BLE001
             self._last_errors[device_id] = str(err)
+            camera.async_write_ha_state()
             LOGGER.debug("RTSP proxy client failed for %s: %s", device_id, err)
         finally:
             if proxy is not None:
@@ -205,6 +207,7 @@ class PetkitRTSPProxyManager:
                             await task
                     except Exception as err:  # noqa: BLE001
                         self._last_errors.setdefault(device_id, str(err))
+                        camera.async_write_ha_state()
                         LOGGER.debug(
                             "RTSP proxy task cleanup failed for %s: %s",
                             device_id,

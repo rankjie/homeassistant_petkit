@@ -17,6 +17,10 @@ from .const import DOMAIN, LOGGER
 
 _GO2RTC_DOMAIN = "go2rtc"
 _HA_MANAGED_URL = "http://127.0.0.1:11984/"
+_HA_MANAGED_URL_ALIASES = {
+    _HA_MANAGED_URL,
+    "http://localhost:11984/",
+}
 _SIGN_EXPIRATION = timedelta(days=365)
 _GO2RTC_API_PATH = "api/streams"
 _GO2RTC_RTSP_BASE = "rtsp://127.0.0.1:18554"
@@ -38,15 +42,20 @@ class PetkitGo2RTCStreamManager:
     @property
     def _base_url(self) -> str:
         """Return the go2rtc API base URL."""
-        go2rtc_data = self.hass.data.get(_GO2RTC_DOMAIN)
-        url = getattr(go2rtc_data, "url", None)
-        return url or _HA_MANAGED_URL
+        url = self._configured_url
+        if url in _HA_MANAGED_URL_ALIASES or url is None:
+            return _HA_MANAGED_URL
+        return url
 
     def is_managed_available(self) -> bool:
         """Return whether HA-managed go2rtc is active."""
+        return self._configured_url in _HA_MANAGED_URL_ALIASES
+
+    @property
+    def _configured_url(self) -> str | None:
+        """Return the go2rtc URL stored by Home Assistant."""
         go2rtc_data = self.hass.data.get(_GO2RTC_DOMAIN)
-        url = getattr(go2rtc_data, "url", go2rtc_data)
-        return url == _HA_MANAGED_URL
+        return getattr(go2rtc_data, "url", go2rtc_data)
 
     def stream_name(self, device_id: str) -> str:
         """Return the deterministic go2rtc stream name for one device."""

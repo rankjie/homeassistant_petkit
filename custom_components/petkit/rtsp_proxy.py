@@ -146,7 +146,10 @@ class PetkitRTSPProxyManager:
         device_id = str(camera.device.id)
         manager = get_go2rtc_stream_manager(self.hass)
         local_rtsp = await manager.async_ensure_stream(device_id, raise_on_failure=True)
-        assert local_rtsp is not None
+        if local_rtsp is None:
+            raise RuntimeError(
+                f"HA-managed go2rtc stream unavailable for RTSP proxy {device_id}"
+            )
 
         local_parts = urlsplit(local_rtsp)
         local_target = urlunsplit(

@@ -199,8 +199,16 @@ class PetkitRTSPProxyManager:
                 for task in proxy.tasks:
                     task.cancel()
                 for task in proxy.tasks:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                    try:
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                    except Exception as err:  # noqa: BLE001
+                        self._last_errors.setdefault(device_id, str(err))
+                        LOGGER.debug(
+                            "RTSP proxy task cleanup failed for %s: %s",
+                            device_id,
+                            err,
+                        )
             if upstream_writer is not None:
                 upstream_writer.close()
                 with contextlib.suppress(Exception):

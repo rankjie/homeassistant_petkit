@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import timedelta
 from http import HTTPStatus
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
@@ -16,6 +17,7 @@ from .const import DOMAIN, LOGGER
 
 _GO2RTC_DOMAIN = "go2rtc"
 _HA_MANAGED_URL = "http://localhost:11984/"
+_SIGN_EXPIRATION = timedelta(days=365)
 _GO2RTC_API_PATH = "api/streams"
 _GO2RTC_RTSP_BASE = "rtsp://127.0.0.1:18554"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
@@ -63,6 +65,7 @@ class PetkitGo2RTCStreamManager:
         signed_path = async_sign_path(
             self.hass,
             f"/api/petkit/whep_upstream/{device_id}",
+            _SIGN_EXPIRATION,
         )
         return f"webrtc:http://127.0.0.1:{http_server.server_port}{signed_path}"
 

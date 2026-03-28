@@ -14,6 +14,12 @@ from sdp_transform import parse as sdp_parse
 from webrtc_models import RTCIceCandidateInit
 
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http.auth import DATA_SIGN_SECRET, SIGN_QUERY_PARAM
+from homeassistant.components.http.const import (
+    KEY_HASS_REFRESH_TOKEN_ID,
+    KEY_HASS_USER,
+)
+from homeassistant.auth import jwt_wrapper
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .agora_rtm import AgoraRTMSignaling
@@ -37,6 +43,9 @@ def _check_external_auth(request: web.Request) -> web.Response | None:
     if request.get("hass_user"):
         return None
 
+    if _validate_signed_request(hass, request):
+        return None
+
     token = request.query.get("token")
     if token:
         if hass.auth.async_validate_access_token(token) is None:
@@ -44,6 +53,44 @@ def _check_external_auth(request: web.Request) -> web.Response | None:
         return None
 
     return web.Response(status=401, text="Authentication required")
+
+
+def _validate_signed_request(hass, request: web.Request) -> bool:
+    """Validate an authSig-signed request for non-GET WHEP traffic."""
+    if (secret := hass.data.get(DATA_SIGN_SECRET)) is None:
+        return False
+
+    if (signature := request.query.get(SIGN_QUERY_PARAM)) is None:
+        return False
+
+    try:
+        claims = jwt_wrapper.verify_and_decode(
+            signature,
+            secret,
+            algorithms=["HS256"],
+            options={"verify_iss": False},
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+    if claims.get("path") != request.path:
+        return False
+
+    params = [
+        list(item)
+        for item in request.query.items()
+        if item[0] != SIGN_QUERY_PARAM
+    ]
+    if claims.get("params") != params:
+        return False
+
+    refresh_token = hass.auth.async_get_refresh_token(claims.get("iss"))
+    if refresh_token is None:
+        return False
+
+    request[KEY_HASS_USER] = refresh_token.user
+    request[KEY_HASS_REFRESH_TOKEN_ID] = refresh_token.id
+    return True
 
 
 @dataclass

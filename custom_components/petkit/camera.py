@@ -167,6 +167,13 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
         return {
             "rtsp_stream_url": rtsp_url,
+            **(
+                {"rtsp_last_error": last_error}
+                if (
+                    last_error := manager.last_error(device_id)
+                )
+                else {}
+            ),
         }
 
     async def async_added_to_hass(self) -> None:

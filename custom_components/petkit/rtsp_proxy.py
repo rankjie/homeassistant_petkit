@@ -55,6 +55,7 @@ class PetkitRTSPProxyManager:
         self.hass = hass
         self._lock = asyncio.Lock()
         self._servers: dict[str, RtspProxyServer] = {}
+        self._last_errors: dict[str, str] = {}
 
     async def async_ensure_listener(self, camera: PetkitWebRTCCamera) -> str | None:
         """Ensure the RTSP proxy listener exists for one camera."""
@@ -93,6 +94,10 @@ class PetkitRTSPProxyManager:
             device_ids = list(self._servers)
         for device_id in device_ids:
             await self.async_close_listener(device_id)
+
+    def last_error(self, device_id: str) -> str | None:
+        """Return the last RTSP proxy failure for one device."""
+        return self._last_errors.get(device_id)
 
     def local_rtsp_url(self, device_id: str) -> str:
         """Return the loopback RTSP proxy URL for one device."""
@@ -159,6 +164,7 @@ class PetkitRTSPProxyManager:
         upstream_reader = upstream_writer = None
         proxy = None
         try:
+            self._last_errors.pop(device_id, None)
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 _LOCALHOST,
                 _GO2RTC_RTSP_PORT,
@@ -181,6 +187,7 @@ class PetkitRTSPProxyManager:
             ]
             await asyncio.wait(proxy.tasks, return_when=asyncio.FIRST_COMPLETED)
         except Exception as err:  # noqa: BLE001
+            self._last_errors[device_id] = str(err)
             LOGGER.debug("RTSP proxy client failed for %s: %s", device_id, err)
         finally:
             if proxy is not None:
@@ -245,12 +252,16 @@ class PetkitRTSPProxyManager:
 
     async def _upstream_to_client(self, proxy: RtspProxyClient) -> None:
         """Relay bytes from the local go2rtc RTSP server back to the client."""
+        forwarded_any = False
         while not proxy.upstream_reader.at_eof():
             data = await proxy.upstream_reader.read(65536)
             if not data:
                 break
+            forwarded_any = True
             proxy.client_writer.write(data)
             await proxy.client_writer.drain()
+        if not forwarded_any:
+            raise RuntimeError("Local go2rtc RTSP server closed without a response")
 
     @staticmethod
     def _preferred_port(device_id: str) -> int:

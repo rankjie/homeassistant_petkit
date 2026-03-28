@@ -17,6 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 
 from .const import DOMAIN, LOGGER
+from .rtsp_proxy import get_rtsp_proxy_manager
 
 _GO2RTC_DOMAIN = "go2rtc"
 _HA_MANAGED_URL_ALIASES = {
@@ -136,6 +137,7 @@ class PetkitGo2RTCStreamManager:
         lock = self._locks.setdefault(stream_name, asyncio.Lock())
         async with lock:
             if await self._async_stream_matches(base_url, stream_name, source):
+                await self._async_migrate_legacy_streams(base_url, camera)
                 return await self.rtsp_url(camera)
 
             methods: tuple[tuple[str, dict[str, str]], ...] = (
@@ -155,8 +157,10 @@ class PetkitGo2RTCStreamManager:
                     HTTPStatus.CREATED,
                     HTTPStatus.NO_CONTENT,
                 ):
+                    await self._async_migrate_legacy_streams(base_url, camera)
                     return await self.rtsp_url(camera)
                 if await self._async_stream_matches(base_url, stream_name, source):
+                    await self._async_migrate_legacy_streams(base_url, camera)
                     return await self.rtsp_url(camera)
 
             LOGGER.warning(
@@ -330,6 +334,92 @@ class PetkitGo2RTCStreamManager:
     def _normalize_url(url: str) -> str:
         """Normalize one go2rtc base URL for API calls."""
         return url.rstrip("/") + "/"
+
+    async def _async_migrate_legacy_streams(self, base_url: str, camera) -> None:
+        """Rewrite deprecated external go2rtc stream sources to the shared stream."""
+        streams = await self._async_get_streams(base_url)
+        if streams is None:
+            return
+
+        device_id = str(camera.device.id)
+        canonical_name = self.stream_name(device_id)
+        canonical_rtsp = await self.rtsp_url(camera)
+        if canonical_rtsp is None:
+            return
+
+        deprecated_sources = self._deprecated_sources(camera)
+        if not deprecated_sources:
+            return
+
+        for stream_name, stream in streams.items():
+            if stream_name == canonical_name or not isinstance(stream, dict):
+                continue
+
+            producers = stream.get("producers") or []
+            if not any(
+                isinstance(producer, dict)
+                and str(producer.get("url", "")).rstrip("/") in deprecated_sources
+                for producer in producers
+            ):
+                continue
+
+            if await self._async_stream_matches(base_url, stream_name, canonical_rtsp):
+                continue
+
+            methods: tuple[tuple[str, dict[str, str]], ...] = (
+                ("put", {"name": stream_name, "src": canonical_rtsp}),
+                ("patch", {"name": stream_name, "src": canonical_rtsp}),
+                ("patch", {"dst": stream_name, "src": canonical_rtsp}),
+            )
+            for method, params in methods:
+                status, _ = await self._async_call_api(base_url, method, params)
+                if status in (
+                    HTTPStatus.OK,
+                    HTTPStatus.CREATED,
+                    HTTPStatus.NO_CONTENT,
+                ) or await self._async_stream_matches(
+                    base_url, stream_name, canonical_rtsp
+                ):
+                    LOGGER.debug(
+                        "Migrated legacy go2rtc stream %s for %s to shared source %s",
+                        stream_name,
+                        device_id,
+                        canonical_rtsp,
+                    )
+                    break
+
+    def _deprecated_sources(self, camera) -> set[str]:
+        """Return legacy source URLs for one camera that should point at the shared stream."""
+        device_id = str(camera.device.id)
+        deprecated: set[str] = set()
+        rtsp_proxy = get_rtsp_proxy_manager(self.hass)
+
+        deprecated.add(rtsp_proxy.local_rtsp_url(device_id).rstrip("/"))
+
+        for base_url in self._ha_base_urls():
+            deprecated.add(
+                rtsp_proxy.rtsp_url_for_host(device_id, urlsplit(base_url).hostname).rstrip("/")
+            )
+            deprecated.add(
+                f"webrtc:{base_url}/api/petkit/whep_direct/{device_id}"
+            )
+            deprecated.add(
+                f"webrtc:{base_url}/api/petkit/whep_mirror/{device_id}"
+            )
+
+        return deprecated
+
+    def _ha_base_urls(self) -> set[str]:
+        """Return reachable Home Assistant base URLs without trailing slashes."""
+        base_urls: set[str] = set()
+        for prefer_external in (False, True):
+            try:
+                base_url = get_url(self.hass, prefer_external=prefer_external)
+            except NoURLAvailableError:
+                continue
+            if base_url:
+                base_urls.add(base_url.rstrip("/"))
+        return base_urls
 
 
 def get_go2rtc_stream_manager(hass: HomeAssistant) -> PetkitGo2RTCStreamManager:

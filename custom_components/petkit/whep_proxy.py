@@ -111,7 +111,7 @@ class Go2RTCProxySession:
 
     session_id: str
     device_id: str
-    upstream_location: str
+    upstream_location: str | None
 
 
 class PetkitAgoraUpstreamManager:
@@ -317,15 +317,17 @@ class PetkitGo2RTCProxyManager:
             )
 
         upstream_location = response.headers.get("Location")
-        if not upstream_location:
-            raise RuntimeError("go2rtc WHEP setup did not return a session location")
 
         proxy_session_id = secrets.token_hex(16)
         async with self._lock:
             self._sessions[(device_id, proxy_session_id)] = Go2RTCProxySession(
                 session_id=proxy_session_id,
                 device_id=device_id,
-                upstream_location=self._normalize_location(base_url, upstream_location),
+                upstream_location=(
+                    self._normalize_location(base_url, upstream_location)
+                    if upstream_location
+                    else None
+                ),
             )
 
         return proxy_session_id, response.body_text
@@ -345,6 +347,19 @@ class PetkitGo2RTCProxyManager:
             session = self._sessions.get((device_id, session_id))
         if session is None:
             return None
+
+        if session.upstream_location is None:
+            if forget or method == "DELETE":
+                async with self._lock:
+                    self._sessions.pop((device_id, session_id), None)
+            status = HTTPStatus.OK if method == "DELETE" else HTTPStatus.NO_CONTENT
+            return _ProxyResponse(
+                status=status,
+                body=b"",
+                body_text="",
+                headers={},
+                content_type=None,
+            )
 
         response = await self._request(
             method,

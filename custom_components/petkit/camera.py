@@ -587,6 +587,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     def get_ice_servers(self) -> list[RTCIceServer]:
         """Return cached Agora ICE servers for Home Assistant frontend."""
+        if get_go2rtc_stream_manager(self.hass).is_available(self):
+            return []
         return self._ice_servers
 
     async def _async_close_direct_stream(

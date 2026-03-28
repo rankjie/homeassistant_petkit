@@ -257,8 +257,7 @@ class PetkitGo2RTCProxyManager:
     ) -> tuple[str, str]:
         """Create one public WHEP session against the shared go2rtc stream."""
         stream_manager = get_go2rtc_stream_manager(self.hass)
-        if await stream_manager.async_ensure_stream(device_id) is None:
-            raise RuntimeError("HA-managed go2rtc stream unavailable")
+        await stream_manager.async_ensure_stream(device_id, raise_on_failure=True)
 
         response = await self._request(
             "POST",

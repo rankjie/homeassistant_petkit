@@ -69,17 +69,22 @@ class PetkitGo2RTCStreamManager:
         )
         return f"webrtc:http://127.0.0.1:{http_server.server_port}{signed_path}"
 
-    async def async_ensure_stream(self, device_id: str) -> str | None:
+    async def async_ensure_stream(
+        self,
+        device_id: str,
+        *,
+        raise_on_failure: bool = False,
+    ) -> str | None:
         """Ensure the shared go2rtc stream exists and return its local RTSP URL."""
         if not self.is_managed_available():
             return None
 
         source = self.internal_webrtc_source(device_id)
         if source is None:
-            LOGGER.debug(
-                "PetKit go2rtc stream %s unavailable: HA HTTP server not ready",
-                device_id,
-            )
+            message = f"PetKit go2rtc stream {device_id} unavailable: HA HTTP server not ready"
+            LOGGER.debug(message)
+            if raise_on_failure:
+                raise RuntimeError(message)
             return None
 
         stream_name = self.stream_name(device_id)
@@ -113,6 +118,11 @@ class PetkitGo2RTCStreamManager:
                 device_id,
                 ", ".join(statuses),
             )
+            if raise_on_failure:
+                raise RuntimeError(
+                    f"Failed to register PetKit go2rtc stream {device_id}"
+                    f" ({', '.join(statuses)})"
+                )
             return None
 
     async def async_remove_stream(self, device_id: str) -> bool:

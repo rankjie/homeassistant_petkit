@@ -165,16 +165,15 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 else manager.local_rtsp_url(device_id)
             )
 
-        return {
+        attributes: dict[str, str | int | bool] = {
             "rtsp_stream_url": rtsp_url,
-            **(
-                {"rtsp_last_error": last_error}
-                if (
-                    last_error := manager.last_error(device_id)
-                )
-                else {}
-            ),
+            "rtsp_listener_active": manager.listener_port(device_id) is not None,
         }
+        if listener_port := manager.listener_port(device_id):
+            attributes["rtsp_listener_port"] = listener_port
+        if last_error := manager.last_error(device_id):
+            attributes["rtsp_last_error"] = last_error
+        return attributes
 
     async def async_added_to_hass(self) -> None:
         """Register ICE callback when entity is added."""

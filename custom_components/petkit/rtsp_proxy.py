@@ -99,6 +99,11 @@ class PetkitRTSPProxyManager:
         """Return the last RTSP proxy failure for one device."""
         return self._last_errors.get(device_id)
 
+    def listener_port(self, device_id: str) -> int | None:
+        """Return the active listener port for one device."""
+        active = self._servers.get(device_id)
+        return active.port if active is not None else None
+
     def local_rtsp_url(self, device_id: str) -> str:
         """Return the loopback RTSP proxy URL for one device."""
         return f"rtsp://{_LOCALHOST}:{self._port_for_device(device_id)}/{device_id}"

@@ -21,7 +21,6 @@ from webrtc_models import RTCIceCandidateInit, RTCIceServer
 from homeassistant.components.camera import (
     CameraEntityDescription,
     CameraCapabilities,
-    CameraWebRTCProvider,
     WebRTCAnswer,
     WebRTCError,
     WebRTCSendMessage,
@@ -46,7 +45,11 @@ from .const import (
 )
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
+from .go2rtc_stream import get_go2rtc_stream_manager
 from .rtsp_proxy import get_rtsp_proxy_manager
+from .whep_proxy import get_whep_proxy_manager
+
+CONF_EXTERNAL_GO2RTC_URL = "external_go2rtc_url"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -142,7 +145,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._pending_mirror_browser_candidates: dict[
             str, list[RTCIceCandidateInit]
         ] = {}
-        self._go2rtc_browser_sessions: dict[str, CameraWebRTCProvider] = {}
+        self._go2rtc_browser_sessions: dict[str, str] = {}
 
     @property
     def available(self) -> bool:
@@ -151,12 +154,23 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     @property
     def camera_capabilities(self) -> CameraCapabilities:
-        """Force the frontend onto the stream/HLS path backed by the RTSP listener."""
+        """Advertise low-latency WebRTC plus stream/HLS when a shared go2rtc is configured."""
+        if get_go2rtc_stream_manager(self.hass).is_available(self):
+            return CameraCapabilities(
+                frontend_stream_types={StreamType.WEB_RTC, StreamType.HLS}
+            )
         return CameraCapabilities(frontend_stream_types={StreamType.HLS})
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose the stable shared RTSP URL for external consumers."""
+        """Expose the stable shared stream URLs for external consumers."""
+        external_go2rtc = get_go2rtc_stream_manager(self.hass)
+        if external_go2rtc.is_available(self):
+            return {
+                "go2rtc_stream_name": external_go2rtc.stream_name(str(self.device.id)),
+                "go2rtc_api_url": self._external_go2rtc_url(),
+            }
+
         manager = get_rtsp_proxy_manager(self.hass)
         device_id = str(self.device.id)
         try:
@@ -186,7 +200,17 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         await super().async_added_to_hass()
         self.hass.data.setdefault(DOMAIN, {}).setdefault("cameras", {})
         self.hass.data[DOMAIN]["cameras"][str(self.device.id)] = self
-        await get_rtsp_proxy_manager(self.hass).async_ensure_listener(self)
+        if get_go2rtc_stream_manager(self.hass).is_available(self):
+            try:
+                await get_go2rtc_stream_manager(self.hass).async_ensure_stream(self)
+            except RuntimeError as err:
+                LOGGER.debug(
+                    "Failed to register shared go2rtc stream for %s: %s",
+                    self.device.id,
+                    err,
+                )
+        else:
+            await get_rtsp_proxy_manager(self.hass).async_ensure_listener(self)
         self._remove_ice_servers = async_register_ice_servers(
             self.hass,
             self.get_ice_servers,
@@ -200,7 +224,12 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if DOMAIN in self.hass.data and "cameras" in self.hass.data[DOMAIN]:
             self.hass.data[DOMAIN]["cameras"].pop(str(self.device.id), None)
 
-        await get_rtsp_proxy_manager(self.hass).async_close_listener(str(self.device.id))
+        if get_go2rtc_stream_manager(self.hass).is_available(self):
+            await get_go2rtc_stream_manager(self.hass).async_remove_stream(self)
+        else:
+            await get_rtsp_proxy_manager(self.hass).async_close_listener(
+                str(self.device.id)
+            )
         await self._async_close_stream()
         await super().async_will_remove_from_hass()
 
@@ -309,6 +338,11 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def stream_source(self) -> str | None:
         """Return the preferred source for downstream stream consumers."""
+        external_go2rtc = get_go2rtc_stream_manager(self.hass)
+        if external_go2rtc.is_available(self):
+            rtsp_url = await external_go2rtc.async_ensure_stream(self)
+            if rtsp_url:
+                return rtsp_url
         return await get_rtsp_proxy_manager(self.hass).async_ensure_listener(self)
 
     async def async_handle_async_webrtc_offer(
@@ -318,6 +352,29 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         send_message: WebRTCSendMessage,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
+        if get_go2rtc_stream_manager(self.hass).is_available(self):
+            try:
+                shared_answer = await self._async_try_shared_go2rtc_browser_offer(
+                    offer_sdp, session_id
+                )
+            except RuntimeError as err:
+                LOGGER.error(
+                    "Shared go2rtc browser path failed for %s: %s",
+                    self.device.id,
+                    err,
+                )
+                send_message(
+                    WebRTCError(
+                        code="shared_go2rtc_failed",
+                        message=str(err),
+                    )
+                )
+                return
+
+            if shared_answer:
+                send_message(WebRTCAnswer(shared_answer))
+                return
+
         answer_sdp = await self._async_try_rebroadcast_browser_offer(
             offer_sdp,
             session_id,
@@ -398,6 +455,30 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
                 )
             )
 
+    async def _async_try_shared_go2rtc_browser_offer(
+        self,
+        offer_sdp: str,
+        session_id: str,
+    ) -> str | None:
+        """Route browser WebRTC to the configured shared go2rtc stream."""
+        stream_manager = get_go2rtc_stream_manager(self.hass)
+        if not stream_manager.is_available(self):
+            return None
+
+        await stream_manager.async_ensure_stream(self, raise_on_failure=True)
+        proxy_session_id, answer_sdp = await get_whep_proxy_manager(
+            self.hass
+        ).create_session(
+            str(self.device.id),
+            offer_sdp,
+            {
+                "Content-Type": "application/sdp",
+                "Accept": "application/sdp",
+            },
+        )
+        self._go2rtc_browser_sessions[session_id] = proxy_session_id
+        return answer_sdp
+
     async def _async_try_rebroadcast_browser_offer(
         self,
         offer_sdp: str,
@@ -445,8 +526,17 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         candidate: RTCIceCandidateInit,
     ) -> None:
         """Collect browser ICE candidates for join_v3."""
-        if provider := self._go2rtc_browser_sessions.get(session_id):
-            await provider.async_on_webrtc_candidate(session_id, candidate)
+        if proxy_session_id := self._go2rtc_browser_sessions.get(session_id):
+            await get_whep_proxy_manager(self.hass).proxy_session_request(
+                str(self.device.id),
+                proxy_session_id,
+                "PATCH",
+                body=self._candidate_fragment(candidate).encode(),
+                headers={
+                    "Content-Type": "application/trickle-ice-sdpfrag",
+                    "If-Match": "*",
+                },
+            )
             return
 
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
@@ -473,8 +563,16 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
         """Close and cleanup a direct browser WebRTC session."""
-        if provider := self._go2rtc_browser_sessions.pop(session_id, None):
-            provider.async_close_session(session_id)
+        if proxy_session_id := self._go2rtc_browser_sessions.pop(session_id, None):
+            self.hass.async_create_task(
+                get_whep_proxy_manager(self.hass).proxy_session_request(
+                    str(self.device.id),
+                    proxy_session_id,
+                    "DELETE",
+                    headers={},
+                    forget=True,
+                )
+            )
             return
 
         if (
@@ -516,8 +614,8 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
         """Stop direct browser state and any active browser relay session."""
-        for session_id, provider in list(self._go2rtc_browser_sessions.items()):
-            provider.async_close_session(session_id)
+        for session_id in list(self._go2rtc_browser_sessions):
+            self.close_webrtc_session(session_id)
         self._go2rtc_browser_sessions.clear()
         self._mirror_browser_sessions.clear()
         self._pending_mirror_browser_sessions.clear()
@@ -629,15 +727,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if mode not in (STREAM_CONTROL_SHARED, STREAM_CONTROL_EXCLUSIVE):
             return DEFAULT_STREAM_CONTROL_MODE
         return mode
-
-    async def _async_get_go2rtc_provider(self) -> CameraWebRTCProvider | None:
-        """Return the HA-registered go2rtc WebRTC provider when available."""
-        from homeassistant.components.camera.webrtc import async_get_supported_provider
-
-        provider = await async_get_supported_provider(self.hass, self)
-        if provider is None or provider.domain != "go2rtc":
-            return None
-        return provider
 
     async def _refresh_rtc_token(self) -> str | None:
         """Fetch fresh live feed tokens and return the latest RTC token."""
@@ -761,3 +850,23 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     ) -> list[RTCIceCandidateInit]:
         """Filter Agora ICE candidates for browser relay helpers."""
         return self._filter_candidates(candidates, agora_response)
+
+    def _external_go2rtc_url(self) -> str:
+        """Return the configured shared go2rtc API URL."""
+        return str(
+            self.coordinator.config_entry.options.get(CONF_EXTERNAL_GO2RTC_URL, "")
+        ).strip()
+
+    @staticmethod
+    def _candidate_fragment(candidate: RTCIceCandidateInit) -> str:
+        """Encode one browser ICE candidate as a WHEP SDP fragment."""
+        candidate_line = candidate.candidate or ""
+        if candidate_line.startswith("candidate:"):
+            candidate_line = f"a={candidate_line}"
+        elif not candidate_line.startswith("a="):
+            candidate_line = f"a={candidate_line}"
+        return (
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+            f"a=mid:{candidate.sdp_mid or '0'}\r\n"
+            f"{candidate_line}\r\n"
+        )

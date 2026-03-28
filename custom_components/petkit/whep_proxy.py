@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
-_HA_MANAGED_URL = "http://127.0.0.1:11984/"
 _GO2RTC_WHEP_PATH = "api/webrtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=15)
 
@@ -245,10 +244,6 @@ class PetkitGo2RTCProxyManager:
     def _session(self) -> ClientSession:
         return async_get_clientsession(self.hass)
 
-    @property
-    def _base_url(self) -> str:
-        return _HA_MANAGED_URL
-
     async def create_session(
         self,
         device_id: str,
@@ -257,11 +252,15 @@ class PetkitGo2RTCProxyManager:
     ) -> tuple[str, str]:
         """Create one public WHEP session against the shared go2rtc stream."""
         stream_manager = get_go2rtc_stream_manager(self.hass)
+        base_url = stream_manager.api_base_url(device_id)
+        if base_url is None:
+            raise RuntimeError("No shared go2rtc instance configured for this camera")
+
         await stream_manager.async_ensure_stream(device_id, raise_on_failure=True)
 
         response = await self._request(
             "POST",
-            self._stream_url(device_id),
+            self._stream_url(device_id, base_url),
             body=offer_sdp.encode(),
             headers=headers,
         )
@@ -279,7 +278,7 @@ class PetkitGo2RTCProxyManager:
             self._sessions[(device_id, proxy_session_id)] = Go2RTCProxySession(
                 session_id=proxy_session_id,
                 device_id=device_id,
-                upstream_location=self._normalize_location(upstream_location),
+                upstream_location=self._normalize_location(base_url, upstream_location),
             )
 
         return proxy_session_id, response.body_text
@@ -323,18 +322,18 @@ class PetkitGo2RTCProxyManager:
             with contextlib.suppress(Exception):
                 await self._request("DELETE", session.upstream_location, headers={})
 
-    def _stream_url(self, device_id: str) -> str:
+    def _stream_url(self, device_id: str, base_url: str) -> str:
         """Return the internal go2rtc WHEP viewer URL for one device stream."""
         stream_name = get_go2rtc_stream_manager(self.hass).stream_name(device_id)
-        return f"{self._base_url}{_GO2RTC_WHEP_PATH}?src={stream_name}"
+        return f"{base_url}{_GO2RTC_WHEP_PATH}?src={stream_name}"
 
-    def _normalize_location(self, location: str) -> str:
+    def _normalize_location(self, base_url: str, location: str) -> str:
         """Normalize a go2rtc Location header into an absolute internal URL."""
         if location.startswith(("http://", "https://")):
             return location
         if location.startswith("/"):
-            return f"{self._base_url.rstrip('/')}{location}"
-        return f"{self._base_url}{location}"
+            return f"{base_url.rstrip('/')}{location}"
+        return f"{base_url}{location}"
 
     async def _request(
         self,
@@ -409,6 +408,11 @@ def _get_proxy_manager(hass) -> PetkitGo2RTCProxyManager:
         manager = PetkitGo2RTCProxyManager(hass)
         domain_data["whep_proxy_manager"] = manager
     return manager
+
+
+def get_whep_proxy_manager(hass) -> PetkitGo2RTCProxyManager:
+    """Return the shared public WHEP proxy manager."""
+    return _get_proxy_manager(hass)
 
 
 def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
@@ -564,7 +568,7 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             return web.Response(status=400, text="Empty SDP offer")
 
         stream_manager = get_go2rtc_stream_manager(hass)
-        if stream_manager.is_managed_available():
+        if stream_manager.is_available(device_id):
             try:
                 session_id, answer_sdp = await _get_proxy_manager(hass).create_session(
                     device_id,

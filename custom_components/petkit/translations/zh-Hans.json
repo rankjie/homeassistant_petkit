@@ -730,6 +730,7 @@
       "init": {
         "data": {
           "always_on_stream": "常开转播流",
+          "external_go2rtc_url": "共享 go2rtc 地址",
           "region": "区域",
           "scan_interval": "默认轮询间隔（秒）",
           "smart_polling": "智能轮询",
@@ -737,6 +738,7 @@
         },
         "data_description": {
           "always_on_stream": "保持内部转播会话处于预热状态，让浏览器观看、WHEP 客户端以及此摄像头的通用流消费者都能更快连接。该转播流也可以被其他消费者复用。这样会持续维持一个上游会话，并占用更多设备和云端资源。",
+          "external_go2rtc_url": "可选的外部 go2rtc API 地址，例如 http://192.168.1.17:1984。设置后，PetKit 会在该实例中为每个设备注册一个共享流，HA 浏览器播放也会复用同一个接收端。",
           "smart_polling": "智能轮询会根据设备的事件/操作自动调整轮询间隔。"
         },
         "sections": {

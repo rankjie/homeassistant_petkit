@@ -62,6 +62,8 @@ from .const import (
     MEDIA_SECTION,
 )
 
+CONF_EXTERNAL_GO2RTC_URL = "external_go2rtc_url"
+
 
 class PetkitOptionsFlowHandler(OptionsFlow):
     """Handle Petkit options."""
@@ -84,6 +86,13 @@ class PetkitOptionsFlowHandler(OptionsFlow):
                             DEFAULT_ALWAYS_ON_STREAM,
                         ),
                     ): BooleanSelector(BooleanSelectorConfig()),
+                    vol.Optional(
+                        CONF_EXTERNAL_GO2RTC_URL,
+                        default=self.config_entry.options.get(
+                            CONF_EXTERNAL_GO2RTC_URL,
+                            "",
+                        ),
+                    ): vol.All(str),
                     vol.Required(MEDIA_SECTION): section(
                         vol.Schema(
                             {
@@ -238,6 +247,7 @@ class PetkitFlowHandler(ConfigFlow, domain=DOMAIN):
                         data=user_input,
                         options={
                             CONF_ALWAYS_ON_STREAM: DEFAULT_ALWAYS_ON_STREAM,
+                            CONF_EXTERNAL_GO2RTC_URL: "",
                             MEDIA_SECTION: {
                                 CONF_MEDIA_PATH: DEFAULT_MEDIA_PATH,
                                 CONF_SCAN_INTERVAL_MEDIA: DEFAULT_SCAN_INTERVAL_MEDIA,

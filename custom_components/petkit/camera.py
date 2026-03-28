@@ -19,6 +19,7 @@ from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
 from homeassistant.components.camera import (
     CameraEntityDescription,
+    CameraWebRTCProvider,
     WebRTCAnswer,
     WebRTCError,
     WebRTCSendMessage,
@@ -42,6 +43,7 @@ from .const import (
 )
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
+from .go2rtc_stream import get_go2rtc_stream_manager
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -67,7 +69,6 @@ CAMERA_MAPPING: dict[type[Feeder | Litter], list[PetKitCameraDesc]] = {
         )
     ],
 }
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -138,6 +139,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         self._pending_mirror_browser_candidates: dict[
             str, list[RTCIceCandidateInit]
         ] = {}
+        self._go2rtc_browser_sessions: dict[str, CameraWebRTCProvider] = {}
 
     @property
     def available(self) -> bool:
@@ -284,7 +286,12 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             return None
 
     async def stream_source(self) -> str | None:
-        """Return the native WebRTC source identifier for this camera."""
+        """Return the preferred source for downstream stream consumers."""
+        go2rtc_source = await get_go2rtc_stream_manager(self.hass).async_ensure_stream(
+            str(self.device.id)
+        )
+        if go2rtc_source is not None:
+            return go2rtc_source
         return f"webrtc://{self.device.sn}"
 
     async def async_handle_async_webrtc_offer(
@@ -294,6 +301,20 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         send_message: WebRTCSendMessage,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
+        if provider := await self._async_get_go2rtc_provider():
+            self._go2rtc_browser_sessions[session_id] = provider
+            try:
+                await provider.async_handle_async_webrtc_offer(
+                    self,
+                    offer_sdp,
+                    session_id,
+                    send_message,
+                )
+            except Exception:  # noqa: BLE001
+                self._go2rtc_browser_sessions.pop(session_id, None)
+                raise
+            return
+
         answer_sdp = await self._async_try_rebroadcast_browser_offer(
             offer_sdp,
             session_id,
@@ -421,6 +442,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         candidate: RTCIceCandidateInit,
     ) -> None:
         """Collect browser ICE candidates for join_v3."""
+        if provider := self._go2rtc_browser_sessions.get(session_id):
+            await provider.async_on_webrtc_candidate(session_id, candidate)
+            return
+
         from .whep_mirror import AIORTC_IMPORT_ERROR, _get_manager
 
         if session_id in self._mirror_browser_sessions:
@@ -445,6 +470,10 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
         """Close and cleanup a direct browser WebRTC session."""
+        if provider := self._go2rtc_browser_sessions.pop(session_id, None):
+            provider.async_close_session(session_id)
+            return
+
         if (
             session_id in self._mirror_browser_sessions
             or session_id in self._pending_mirror_browser_sessions
@@ -484,6 +513,9 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def _async_close_stream(self, send_stop_override: bool | None = None) -> None:
         """Stop direct browser state and any active browser relay session."""
+        for session_id, provider in list(self._go2rtc_browser_sessions.items()):
+            provider.async_close_session(session_id)
+        self._go2rtc_browser_sessions.clear()
         self._mirror_browser_sessions.clear()
         self._pending_mirror_browser_sessions.clear()
         self._pending_mirror_browser_candidates.clear()
@@ -594,6 +626,18 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         if mode not in (STREAM_CONTROL_SHARED, STREAM_CONTROL_EXCLUSIVE):
             return DEFAULT_STREAM_CONTROL_MODE
         return mode
+
+    async def _async_get_go2rtc_provider(self) -> CameraWebRTCProvider | None:
+        """Return the HA-registered go2rtc WebRTC provider when available."""
+        if not get_go2rtc_stream_manager(self.hass).is_managed_available():
+            return None
+
+        from homeassistant.components.camera.webrtc import async_get_supported_provider
+
+        provider = await async_get_supported_provider(self.hass, self)
+        if provider is None or provider.domain != "go2rtc":
+            return None
+        return provider
 
     async def _refresh_rtc_token(self) -> str | None:
         """Fetch fresh live feed tokens and return the latest RTC token."""

@@ -43,6 +43,8 @@ from .whep_mirror import (
 from .whep_proxy import (
     PetkitDirectWhepProxyView,
     PetkitDirectWhepProxySessionView,
+    PetkitUpstreamWhepSessionView,
+    PetkitUpstreamWhepView,
     async_cleanup_whep_proxy_sessions,
 )
 
@@ -75,6 +77,8 @@ async def async_setup_entry(
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitDirectWhepProxyView())
     hass.http.register_view(PetkitDirectWhepProxySessionView())
+    hass.http.register_view(PetkitUpstreamWhepView())
+    hass.http.register_view(PetkitUpstreamWhepSessionView())
 
     country_from_ha = hass.config.country
     tz_from_ha = hass.config.time_zone
@@ -113,7 +117,6 @@ async def async_setup_entry(
             region=entry.data.get(CONF_REGION, country_from_ha),
             timezone=entry.data.get(CONF_TIME_ZONE, tz_from_ha),
             session=async_get_clientsession(hass),
-            enable_dbg=True,
         ),
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,

@@ -1,22 +1,25 @@
-"""Pure-signaling WHEP proxy for external receivers such as go2rtc."""
+"""WHEP endpoints for PetKit upstream ingest and shared go2rtc output."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from http import HTTPStatus
 import secrets
 from typing import TYPE_CHECKING
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from sdp_transform import parse as sdp_parse
 from webrtc_models import RTCIceCandidateInit
 
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .agora_rtm import AgoraRTMSignaling
 from .agora_websocket import AgoraWebSocketHandler
 from .const import AGORA_APP_ID, DOMAIN, LOGGER
+from .go2rtc_stream import get_go2rtc_stream_manager
 from .webrtc_common import _get_live_feed_for_webrtc
 
 if TYPE_CHECKING:
@@ -24,6 +27,9 @@ if TYPE_CHECKING:
 
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
+_HA_MANAGED_URL = "http://localhost:11984/"
+_GO2RTC_WHEP_PATH = "api/webrtc"
+_REQUEST_TIMEOUT = ClientTimeout(total=15)
 
 
 def _check_external_auth(request: web.Request) -> web.Response | None:
@@ -42,8 +48,8 @@ def _check_external_auth(request: web.Request) -> web.Response | None:
 
 
 @dataclass
-class DirectWhepSession:
-    """One direct Agora session proxied for an external WHEP client."""
+class AgoraUpstreamSession:
+    """One direct Agora session used by the shared go2rtc stream."""
 
     session_id: str
     camera: PetkitWebRTCCamera
@@ -53,20 +59,29 @@ class DirectWhepSession:
     location_path: str = ""
 
 
-class PetkitDirectWhepProxyManager:
-    """Manage direct signaling-only WHEP sessions."""
+@dataclass
+class Go2RTCProxySession:
+    """One public WHEP session proxied to the internal go2rtc stream."""
+
+    session_id: str
+    device_id: str
+    upstream_location: str
+
+
+class PetkitAgoraUpstreamManager:
+    """Manage one direct Agora session per device for go2rtc ingest."""
 
     def __init__(self, hass) -> None:
         self.hass = hass
         self._lock = asyncio.Lock()
-        self._sessions: dict[str, DirectWhepSession] = {}
+        self._sessions: dict[str, AgoraUpstreamSession] = {}
 
     async def create_session(
         self,
         camera: PetkitWebRTCCamera,
         offer_sdp: str,
     ) -> tuple[str, str]:
-        """Create or replace one direct external WHEP session."""
+        """Create or replace one direct Agora session for the device."""
         device_id = str(camera.device.id)
         await self.close_session(device_id)
 
@@ -102,8 +117,6 @@ class PetkitDirectWhepProxyManager:
                     RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
                 )
 
-        # Inline candidates are forwarded to Agora immediately. Trickle ICE sent
-        # later via PATCH is accepted separately on the session resource.
         agora_handler.candidates = camera.filter_agora_candidates(
             agora_handler.candidates,
             camera._agora_response,
@@ -112,7 +125,7 @@ class PetkitDirectWhepProxyManager:
         rtm_started = await agora_rtm.start_live(live_feed)
         if not rtm_started:
             LOGGER.warning(
-                "Direct WHEP proxy start_live/heartbeat not active for %s",
+                "go2rtc upstream start_live/heartbeat not active for %s",
                 device_id,
             )
 
@@ -139,18 +152,18 @@ class PetkitDirectWhepProxyManager:
                 agora_rtm.stop_live(send_stop=True),
                 return_exceptions=True,
             )
-            raise RuntimeError("Agora direct negotiation did not return an SDP answer")
+            raise RuntimeError("Agora upstream negotiation did not return an SDP answer")
 
-        session = DirectWhepSession(
+        session = AgoraUpstreamSession(
             session_id=session_id,
             camera=camera,
             agora_handler=agora_handler,
             agora_rtm=agora_rtm,
-            location_path=f"/api/petkit/whep_direct/{device_id}/{session_id}",
+            location_path=f"/api/petkit/whep_upstream/{device_id}/{session_id}",
         )
         session.refresh_task = self.hass.async_create_background_task(
             self._refresh_tokens(session),
-            f"petkit direct whep refresh {device_id}",
+            f"petkit go2rtc upstream refresh {device_id}",
         )
 
         async with self._lock:
@@ -159,7 +172,7 @@ class PetkitDirectWhepProxyManager:
         return session_id, answer_sdp
 
     async def close_session(self, device_id: str) -> bool:
-        """Close one direct external WHEP session."""
+        """Close one direct Agora session."""
         async with self._lock:
             session = self._sessions.pop(device_id, None)
 
@@ -184,7 +197,7 @@ class PetkitDirectWhepProxyManager:
         session_id: str,
         sdp_fragment: str,
     ) -> bool:
-        """Forward trickled ICE candidates for one active direct WHEP session."""
+        """Forward trickled ICE candidates for one active upstream session."""
         async with self._lock:
             session = self._sessions.get(device_id)
         if session is None or session.session_id != session_id:
@@ -197,21 +210,21 @@ class PetkitDirectWhepProxyManager:
 
         if added:
             LOGGER.debug(
-                "Collected %d external WHEP PATCH candidates for %s",
+                "Collected %d upstream PATCH candidates for %s",
                 added,
                 device_id,
             )
         return True
 
     async def close_all(self) -> None:
-        """Close all active direct WHEP sessions."""
+        """Close all active upstream sessions."""
         async with self._lock:
             device_ids = list(self._sessions)
         for device_id in device_ids:
             await self.close_session(device_id)
 
-    async def _refresh_tokens(self, session: DirectWhepSession) -> None:
-        """Refresh RTM tokens while the direct session is alive."""
+    async def _refresh_tokens(self, session: AgoraUpstreamSession) -> None:
+        """Refresh RTM tokens while the upstream session is alive."""
         while True:
             await asyncio.sleep(TOKEN_REFRESH_INTERVAL_SECONDS)
             live_feed = await _get_live_feed_for_webrtc(session.camera)
@@ -220,12 +233,181 @@ class PetkitDirectWhepProxyManager:
             await session.agora_rtm.update_tokens(live_feed)
 
 
-def _get_manager(hass) -> PetkitDirectWhepProxyManager:
-    """Return the shared direct WHEP proxy manager."""
+class PetkitGo2RTCProxyManager:
+    """Proxy public WHEP sessions to the internal shared go2rtc stream."""
+
+    def __init__(self, hass) -> None:
+        self.hass = hass
+        self._lock = asyncio.Lock()
+        self._sessions: dict[tuple[str, str], Go2RTCProxySession] = {}
+
+    @property
+    def _session(self) -> ClientSession:
+        return async_get_clientsession(self.hass)
+
+    @property
+    def _base_url(self) -> str:
+        return _HA_MANAGED_URL
+
+    async def create_session(
+        self,
+        device_id: str,
+        offer_sdp: str,
+        headers: web.BaseRequest.headers,
+    ) -> tuple[str, str]:
+        """Create one public WHEP session against the shared go2rtc stream."""
+        stream_manager = get_go2rtc_stream_manager(self.hass)
+        if await stream_manager.async_ensure_stream(device_id) is None:
+            raise RuntimeError("HA-managed go2rtc stream unavailable")
+
+        response = await self._request(
+            "POST",
+            self._stream_url(device_id),
+            body=offer_sdp.encode(),
+            headers=headers,
+        )
+        if response.status not in (HTTPStatus.OK, HTTPStatus.CREATED):
+            raise RuntimeError(
+                f"go2rtc WHEP setup failed with status {response.status}: {response.body_text}"
+            )
+
+        upstream_location = response.headers.get("Location")
+        if not upstream_location:
+            raise RuntimeError("go2rtc WHEP setup did not return a session location")
+
+        proxy_session_id = secrets.token_hex(16)
+        async with self._lock:
+            self._sessions[(device_id, proxy_session_id)] = Go2RTCProxySession(
+                session_id=proxy_session_id,
+                device_id=device_id,
+                upstream_location=self._normalize_location(upstream_location),
+            )
+
+        return proxy_session_id, response.body_text
+
+    async def proxy_session_request(
+        self,
+        device_id: str,
+        session_id: str,
+        method: str,
+        *,
+        body: bytes = b"",
+        headers: web.BaseRequest.headers,
+        forget: bool = False,
+    ) -> "_ProxyResponse | None":
+        """Proxy one session-scoped request to go2rtc if the session exists."""
+        async with self._lock:
+            session = self._sessions.get((device_id, session_id))
+        if session is None:
+            return None
+
+        response = await self._request(
+            method,
+            session.upstream_location,
+            body=body,
+            headers=headers,
+        )
+
+        if forget or method == "DELETE":
+            async with self._lock:
+                self._sessions.pop((device_id, session_id), None)
+
+        return response
+
+    async def close_all(self) -> None:
+        """Close all active proxied go2rtc sessions."""
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+
+        for session in sessions:
+            with contextlib.suppress(Exception):
+                await self._request("DELETE", session.upstream_location, headers={})
+
+    def _stream_url(self, device_id: str) -> str:
+        """Return the internal go2rtc WHEP viewer URL for one device stream."""
+        stream_name = get_go2rtc_stream_manager(self.hass).stream_name(device_id)
+        return f"{self._base_url}{_GO2RTC_WHEP_PATH}?src={stream_name}"
+
+    def _normalize_location(self, location: str) -> str:
+        """Normalize a go2rtc Location header into an absolute internal URL."""
+        if location.startswith(("http://", "https://")):
+            return location
+        if location.startswith("/"):
+            return f"{self._base_url.rstrip('/')}{location}"
+        return f"{self._base_url}{location}"
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes = b"",
+        headers,
+    ) -> "_ProxyResponse":
+        """Forward one HTTP request to go2rtc."""
+        forward_headers = _filter_proxy_headers(headers)
+        try:
+            async with self._session.request(
+                method,
+                url,
+                data=body if body else None,
+                headers=forward_headers,
+                timeout=_REQUEST_TIMEOUT,
+            ) as response:
+                raw_body = await response.read()
+                response_headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() in {"content-type", "etag", "location"}
+                }
+                return _ProxyResponse(
+                    status=response.status,
+                    body=raw_body,
+                    body_text=raw_body.decode(errors="ignore"),
+                    headers=response_headers,
+                    content_type=response.content_type,
+                )
+        except (ClientError, TimeoutError) as err:
+            raise RuntimeError(f"go2rtc proxy request failed: {err}") from err
+
+
+@dataclass(frozen=True)
+class _ProxyResponse:
+    """Small transport object for proxied go2rtc responses."""
+
+    status: int
+    body: bytes
+    body_text: str
+    headers: dict[str, str]
+    content_type: str | None
+
+
+def _filter_proxy_headers(headers) -> dict[str, str]:
+    """Forward only the headers relevant to WHEP semantics."""
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() in {"content-type", "accept", "if-match"}
+    }
+
+
+def _get_upstream_manager(hass) -> PetkitAgoraUpstreamManager:
+    """Return the shared upstream manager."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    manager = domain_data.get("whep_upstream_manager")
+    if manager is None:
+        manager = PetkitAgoraUpstreamManager(hass)
+        domain_data["whep_upstream_manager"] = manager
+    return manager
+
+
+def _get_proxy_manager(hass) -> PetkitGo2RTCProxyManager:
+    """Return the shared public WHEP proxy manager."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     manager = domain_data.get("whep_proxy_manager")
     if manager is None:
-        manager = PetkitDirectWhepProxyManager(hass)
+        manager = PetkitGo2RTCProxyManager(hass)
         domain_data["whep_proxy_manager"] = manager
     return manager
 
@@ -266,21 +448,25 @@ def _parse_trickle_candidates(sdp_fragment: str) -> list[RTCIceCandidateInit]:
 
 
 async def async_cleanup_whep_proxy_sessions(hass) -> None:
-    """Close all active direct WHEP proxy sessions."""
-    manager = hass.data.get(DOMAIN, {}).pop("whep_proxy_manager", None)
-    if manager is not None:
-        await manager.close_all()
+    """Close all active WHEP proxy state."""
+    proxy_manager = hass.data.get(DOMAIN, {}).pop("whep_proxy_manager", None)
+    if proxy_manager is not None:
+        await proxy_manager.close_all()
+
+    upstream_manager = hass.data.get(DOMAIN, {}).pop("whep_upstream_manager", None)
+    if upstream_manager is not None:
+        await upstream_manager.close_all()
 
 
-class PetkitDirectWhepProxyView(HomeAssistantView):
-    """Public WHEP endpoint that only proxies signaling to Agora."""
+class PetkitUpstreamWhepView(HomeAssistantView):
+    """Internal WHEP endpoint used by the shared go2rtc stream."""
 
-    url = "/api/petkit/whep_direct/{device_id}"
-    name = "api:petkit:whep_direct"
+    url = "/api/petkit/whep_upstream/{device_id}"
+    name = "api:petkit:whep_upstream"
     requires_auth = False
 
     async def post(self, request: web.Request, device_id: str) -> web.Response:
-        """Receive SDP offer and return the direct Agora SDP answer."""
+        """Receive the internal go2rtc SDP offer and return the Agora SDP answer."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
             return auth_error
@@ -296,11 +482,11 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             return web.Response(status=400, text="Empty SDP offer")
 
         try:
-            session_id, answer_sdp = await _get_manager(hass).create_session(
+            session_id, answer_sdp = await _get_upstream_manager(hass).create_session(
                 camera, offer_sdp
             )
         except (OSError, RuntimeError, ValueError) as err:
-            LOGGER.error("Direct WHEP proxy failed for %s: %s", device_id, err)
+            LOGGER.error("go2rtc upstream WHEP failed for %s: %s", device_id, err)
             return web.Response(status=502, text=str(err))
 
         return web.Response(
@@ -310,24 +496,32 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
             headers={"Location": f"{request.path}/{session_id}"},
         )
 
+
+class PetkitUpstreamWhepSessionView(HomeAssistantView):
+    """Session-scoped internal upstream WHEP resource."""
+
+    url = "/api/petkit/whep_upstream/{device_id}/{session_id}"
+    name = "api:petkit:whep_upstream:session"
+    requires_auth = False
+
     async def patch(
         self,
         request: web.Request,
         device_id: str,
         session_id: str,
     ) -> web.Response:
-        """Accept trickled ICE candidates for one direct WHEP session."""
+        """Accept trickled ICE candidates for one active upstream session."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
             return auth_error
 
         body = await request.text()
-        if not await _get_manager(request.app["hass"]).add_session_candidates(
+        if not await _get_upstream_manager(request.app["hass"]).add_session_candidates(
             device_id,
             session_id,
             body,
         ):
-            return web.Response(status=404, text="No active direct WHEP session")
+            return web.Response(status=404, text="No active upstream WHEP session")
         return web.Response(status=204)
 
     async def delete(
@@ -336,19 +530,78 @@ class PetkitDirectWhepProxyView(HomeAssistantView):
         device_id: str,
         session_id: str,
     ) -> web.Response:
-        """Tear down the active direct WHEP session."""
+        """Tear down the active upstream WHEP session."""
         auth_error = _check_external_auth(request)
         if auth_error is not None:
             return auth_error
 
-        if not await _get_manager(request.app["hass"]).close_session(device_id):
-            return web.Response(status=404, text="No active direct WHEP session")
+        if not await _get_upstream_manager(request.app["hass"]).close_session(device_id):
+            return web.Response(status=404, text="No active upstream WHEP session")
 
         return web.Response(status=200, text="Session closed")
 
 
+class PetkitDirectWhepProxyView(HomeAssistantView):
+    """Public stable WHEP endpoint backed by the shared internal go2rtc stream."""
+
+    url = "/api/petkit/whep_direct/{device_id}"
+    name = "api:petkit:whep_direct"
+    requires_auth = False
+
+    async def post(self, request: web.Request, device_id: str) -> web.Response:
+        """Receive SDP offer and return the shared go2rtc SDP answer."""
+        auth_error = _check_external_auth(request)
+        if auth_error is not None:
+            return auth_error
+
+        hass = request.app["hass"]
+        cameras = hass.data.get(DOMAIN, {}).get("cameras", {})
+        camera = cameras.get(device_id)
+        if camera is None:
+            return web.Response(status=404, text="Camera not found")
+
+        offer_sdp = await request.text()
+        if not offer_sdp or not offer_sdp.strip():
+            return web.Response(status=400, text="Empty SDP offer")
+
+        stream_manager = get_go2rtc_stream_manager(hass)
+        if stream_manager.is_managed_available():
+            try:
+                session_id, answer_sdp = await _get_proxy_manager(hass).create_session(
+                    device_id,
+                    offer_sdp,
+                    request.headers,
+                )
+            except RuntimeError as err:
+                LOGGER.error("Direct WHEP proxy failed for %s: %s", device_id, err)
+                return web.Response(status=502, text=str(err))
+
+            return web.Response(
+                status=201,
+                text=answer_sdp,
+                content_type="application/sdp",
+                headers={"Location": f"{request.path}/{session_id}"},
+            )
+
+        try:
+            session_id, answer_sdp = await _get_upstream_manager(hass).create_session(
+                camera,
+                offer_sdp,
+            )
+        except (OSError, RuntimeError, ValueError) as err:
+            LOGGER.error("Direct WHEP fallback failed for %s: %s", device_id, err)
+            return web.Response(status=502, text=str(err))
+
+        return web.Response(
+            status=201,
+            text=answer_sdp,
+            content_type="application/sdp",
+            headers={"Location": f"{request.path}/{session_id}"},
+        )
+
+
 class PetkitDirectWhepProxySessionView(HomeAssistantView):
-    """Session-scoped WHEP resource path for PATCH / DELETE."""
+    """Session-scoped public WHEP resource for PATCH / DELETE."""
 
     url = "/api/petkit/whep_direct/{device_id}/{session_id}"
     name = "api:petkit:whep_direct:session"
@@ -360,8 +613,30 @@ class PetkitDirectWhepProxySessionView(HomeAssistantView):
         device_id: str,
         session_id: str,
     ) -> web.Response:
-        """Handle trickled ICE candidates on the session resource."""
-        return await PetkitDirectWhepProxyView().patch(request, device_id, session_id)
+        """Handle trickled ICE candidates for the public shared WHEP session."""
+        auth_error = _check_external_auth(request)
+        if auth_error is not None:
+            return auth_error
+
+        body = await request.read()
+        proxied = await _get_proxy_manager(request.app["hass"]).proxy_session_request(
+            device_id,
+            session_id,
+            "PATCH",
+            body=body,
+            headers=request.headers,
+        )
+        if proxied is not None:
+            return web.Response(status=proxied.status, headers=proxied.headers)
+
+        text_body = body.decode(errors="ignore")
+        if not await _get_upstream_manager(request.app["hass"]).add_session_candidates(
+            device_id,
+            session_id,
+            text_body,
+        ):
+            return web.Response(status=404, text="No active direct WHEP session")
+        return web.Response(status=204)
 
     async def delete(
         self,
@@ -369,5 +644,22 @@ class PetkitDirectWhepProxySessionView(HomeAssistantView):
         device_id: str,
         session_id: str,
     ) -> web.Response:
-        """Handle session teardown on the session resource."""
-        return await PetkitDirectWhepProxyView().delete(request, device_id, session_id)
+        """Handle session teardown for the public shared WHEP session."""
+        auth_error = _check_external_auth(request)
+        if auth_error is not None:
+            return auth_error
+
+        proxied = await _get_proxy_manager(request.app["hass"]).proxy_session_request(
+            device_id,
+            session_id,
+            "DELETE",
+            headers=request.headers,
+            forget=True,
+        )
+        if proxied is not None:
+            return web.Response(status=proxied.status, headers=proxied.headers)
+
+        if not await _get_upstream_manager(request.app["hass"]).close_session(device_id):
+            return web.Response(status=404, text="No active direct WHEP session")
+
+        return web.Response(status=200, text="Session closed")

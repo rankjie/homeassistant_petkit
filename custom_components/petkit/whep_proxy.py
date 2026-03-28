@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
-_HA_MANAGED_URL = "http://localhost:11984/"
+_HA_MANAGED_URL = "http://127.0.0.1:11984/"
 _GO2RTC_WHEP_PATH = "api/webrtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=15)
 

@@ -16,7 +16,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DOMAIN, LOGGER
 
 _GO2RTC_DOMAIN = "go2rtc"
-_HA_MANAGED_URL = "http://localhost:11984/"
+_HA_MANAGED_URL = "http://127.0.0.1:11984/"
 _SIGN_EXPIRATION = timedelta(days=365)
 _GO2RTC_API_PATH = "api/streams"
 _GO2RTC_RTSP_BASE = "rtsp://127.0.0.1:18554"

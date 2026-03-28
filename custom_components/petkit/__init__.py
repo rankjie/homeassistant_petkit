@@ -36,12 +36,7 @@ from .coordinator import (
     PetkitMediaUpdateCoordinator,
 )
 from .data import PetkitData
-from .hls_proxy import PetkitHlsProxyView
 from .iot_mqtt import PetkitIotMqttListener
-from .rtsp_proxy import get_rtsp_proxy_manager
-from .whep_mirror import (
-    async_cleanup_whep_mirror_sessions,
-)
 from .whep_proxy import (
     PetkitDirectWhepProxyView,
     PetkitDirectWhepProxySessionView,
@@ -79,7 +74,6 @@ async def async_setup_entry(
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitDirectWhepProxyView())
     hass.http.register_view(PetkitDirectWhepProxySessionView())
-    hass.http.register_view(PetkitHlsProxyView())
     hass.http.register_view(PetkitUpstreamWhepView())
     hass.http.register_view(PetkitUpstreamWhepSessionView())
 
@@ -164,8 +158,6 @@ async def async_unload_entry(
     if mqtt_listener is not None:
         await mqtt_listener.async_stop()
 
-    await get_rtsp_proxy_manager(hass).async_close_all()
-    await async_cleanup_whep_mirror_sessions(hass)
     await async_cleanup_whep_proxy_sessions(hass)
 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

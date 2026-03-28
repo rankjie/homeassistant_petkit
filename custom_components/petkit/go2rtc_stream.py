@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import timedelta
 from http import HTTPStatus
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
@@ -17,7 +17,6 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 
 from .const import DOMAIN, LOGGER
-from .rtsp_proxy import get_rtsp_proxy_manager
 
 _GO2RTC_DOMAIN = "go2rtc"
 _HA_MANAGED_URL_ALIASES = {
@@ -28,7 +27,6 @@ _SIGN_EXPIRATION = timedelta(days=365)
 _GO2RTC_API_PATH = "api/streams"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
 _INFO_TIMEOUT = ClientTimeout(total=5)
-CONF_EXTERNAL_GO2RTC_URL = "external_go2rtc_url"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -46,6 +44,11 @@ class PetkitGo2RTCStreamManager:
         return async_get_clientsession(self.hass)
 
     @property
+    def _go2rtc_data(self):
+        """Return the Home Assistant go2rtc integration runtime data."""
+        return self.hass.data.get(_GO2RTC_DOMAIN)
+
+    @property
     def _configured_url(self) -> str | None:
         """Return the go2rtc URL stored by Home Assistant."""
         go2rtc_data = self.hass.data.get(_GO2RTC_DOMAIN)
@@ -58,22 +61,18 @@ class PetkitGo2RTCStreamManager:
     def configured_url(self, target) -> str | None:
         """Return the preferred go2rtc API base URL for one device."""
         url = self._configured_url
-        if url is not None:
-            return self._normalize_url(url)
-
-        camera = self._resolve_camera(target)
-        if camera is not None:
-            explicit_url = str(
-                camera.coordinator.config_entry.options.get(CONF_EXTERNAL_GO2RTC_URL, "")
-            ).strip()
-            if explicit_url:
-                return self._normalize_url(explicit_url)
-
-        return None
+        return self._normalize_url(url) if url is not None else None
 
     def is_available(self, target) -> bool:
         """Return whether a shared go2rtc instance is configured for one device."""
         return self.configured_url(target) is not None
+
+    def api_session(self, target) -> ClientSession:
+        """Return the aiohttp session that can reach the configured go2rtc API."""
+        base_url = self.configured_url(target)
+        if base_url is None:
+            return self._session
+        return self._session_for_base_url(base_url)
 
     async def rtsp_url(self, target) -> str | None:
         """Return the RTSP URL exposed by the shared go2rtc stream."""
@@ -89,21 +88,6 @@ class PetkitGo2RTCStreamManager:
         if rtsp_base is None:
             return None
         return f"{rtsp_base}/{self.stream_name(str(camera.device.id))}"
-
-    async def hls_master_url(self, target) -> str | None:
-        """Return the local go2rtc HLS master playlist URL for one device."""
-        camera = self._resolve_camera(target)
-        if camera is None:
-            return None
-
-        base_url = self.configured_url(camera)
-        if base_url is None:
-            return None
-
-        return (
-            f"{base_url.rstrip('/')}/api/stream.m3u8"
-            f"?src={self.stream_name(str(camera.device.id))}"
-        )
 
     def internal_webrtc_source(self, target) -> str | None:
         """Return the signed HA WHEP source URL consumed by the shared go2rtc."""
@@ -233,15 +217,19 @@ class PetkitGo2RTCStreamManager:
             return False
 
         producers = stream.get("producers") or []
+        normalized_source = self._normalize_source_url(source)
         return any(
-            isinstance(producer, dict) and producer.get("url") == source
+            isinstance(producer, dict)
+            and self._normalize_source_url(str(producer.get("url", "")))
+            == normalized_source
             for producer in producers
         )
 
     async def _async_get_streams(self, base_url: str) -> dict[str, dict] | None:
         """Fetch the current go2rtc streams payload."""
+        session = self._session_for_base_url(base_url)
         try:
-            async with self._session.get(
+            async with session.get(
                 urljoin(base_url, _GO2RTC_API_PATH),
                 timeout=_REQUEST_TIMEOUT,
             ) as response:
@@ -260,7 +248,10 @@ class PetkitGo2RTCStreamManager:
         self, base_url: str, method: str, params: dict[str, str]
     ) -> tuple[int, str | None]:
         """Call the go2rtc API and return the HTTP status code plus error detail."""
-        request: Callable[..., object] = getattr(self._session, method)
+        request: Callable[..., object] = getattr(
+            self._session_for_base_url(base_url),
+            method,
+        )
         try:
             async with request(
                 urljoin(base_url, _GO2RTC_API_PATH),
@@ -299,8 +290,9 @@ class PetkitGo2RTCStreamManager:
         if base_url in self._server_info:
             return self._server_info[base_url]
 
+        session = self._session_for_base_url(base_url)
         try:
-            async with self._session.get(
+            async with session.get(
                 urljoin(base_url, "api"),
                 timeout=_INFO_TIMEOUT,
             ) as response:
@@ -346,13 +338,66 @@ class PetkitGo2RTCStreamManager:
         cameras = self.hass.data.get(DOMAIN, {}).get("cameras", {})
         return cameras.get(str(target))
 
+    def _session_for_base_url(self, base_url: str) -> ClientSession:
+        """Return the correct aiohttp session for one go2rtc base URL."""
+        go2rtc_data = self._go2rtc_data
+        configured_url = getattr(go2rtc_data, "url", go2rtc_data)
+        configured_session = getattr(go2rtc_data, "session", None)
+        if (
+            configured_session is not None
+            and isinstance(configured_url, str)
+            and self._normalize_url(configured_url) == self._normalize_url(base_url)
+        ):
+            return configured_session
+        return self._session
+
     @staticmethod
     def _normalize_url(url: str) -> str:
         """Normalize one go2rtc base URL for API calls."""
         return url.rstrip("/") + "/"
 
+    @staticmethod
+    def _normalize_source_url(source: str) -> str:
+        """Normalize go2rtc producer URLs for stable comparisons."""
+        if not source:
+            return source
+
+        raw_url = source
+        if ":" in source:
+            prefix, remainder = source.split(":", 1)
+            if remainder.startswith(("http://", "https://")):
+                raw_url = remainder
+                # go2rtc stores HTTP-backed WebRTC producers as plain HTTP URLs in
+                # /api/streams, so the transport wrapper must not participate in
+                # equality checks.
+                if prefix != "webrtc":
+                    raw_url = f"{prefix}:{remainder}"
+
+        parts = urlsplit(raw_url)
+        if not parts.scheme:
+            return source.rstrip("/")
+
+        filtered_query = urlencode(
+            [
+                (key, value)
+                for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                if key not in {"authSig"}
+            ],
+            doseq=True,
+        )
+        normalized = urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path.rstrip("/"),
+                filtered_query,
+                "",
+            )
+        )
+        return normalized.rstrip("/")
+
     async def _async_migrate_legacy_streams(self, base_url: str, camera) -> None:
-        """Rewrite deprecated external go2rtc stream sources to the shared stream."""
+        """Rewrite deprecated stream sources to the canonical shared stream."""
         streams = await self._async_get_streams(base_url)
         if streams is None:
             return
@@ -408,16 +453,15 @@ class PetkitGo2RTCStreamManager:
         """Return legacy source URLs for one camera that should point at the shared stream."""
         device_id = str(camera.device.id)
         deprecated: set[str] = set()
-        rtsp_proxy = get_rtsp_proxy_manager(self.hass)
-
-        deprecated.add(rtsp_proxy.local_rtsp_url(device_id).rstrip("/"))
-
         for base_url in self._ha_base_urls():
             deprecated.add(
-                rtsp_proxy.rtsp_url_for_host(device_id, urlsplit(base_url).hostname).rstrip("/")
+                f"webrtc:{base_url}/api/petkit/whep_direct/{device_id}"
             )
             deprecated.add(
-                f"webrtc:{base_url}/api/petkit/whep_direct/{device_id}"
+                f"{base_url}/api/petkit/whep_direct/{device_id}"
+            )
+            deprecated.add(
+                f"webrtc:{base_url}/api/petkit/whep_upstream/{device_id}"
             )
             deprecated.add(
                 f"webrtc:{base_url}/api/petkit/whep_mirror/{device_id}"

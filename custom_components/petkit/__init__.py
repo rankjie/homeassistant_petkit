@@ -36,6 +36,7 @@ from .coordinator import (
     PetkitMediaUpdateCoordinator,
 )
 from .data import PetkitData
+from .hls_proxy import PetkitHlsProxyView
 from .iot_mqtt import PetkitIotMqttListener
 from .rtsp_proxy import get_rtsp_proxy_manager
 from .whep_mirror import (
@@ -78,6 +79,7 @@ async def async_setup_entry(
     # Register API views once (idempotent — HA deduplicates by name)
     hass.http.register_view(PetkitDirectWhepProxyView())
     hass.http.register_view(PetkitDirectWhepProxySessionView())
+    hass.http.register_view(PetkitHlsProxyView())
     hass.http.register_view(PetkitUpstreamWhepView())
     hass.http.register_view(PetkitUpstreamWhepSessionView())
 

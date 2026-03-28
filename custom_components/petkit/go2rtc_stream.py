@@ -57,6 +57,10 @@ class PetkitGo2RTCStreamManager:
 
     def configured_url(self, target) -> str | None:
         """Return the preferred go2rtc API base URL for one device."""
+        url = self._configured_url
+        if url is not None:
+            return self._normalize_url(url)
+
         camera = self._resolve_camera(target)
         if camera is not None:
             explicit_url = str(
@@ -65,10 +69,7 @@ class PetkitGo2RTCStreamManager:
             if explicit_url:
                 return self._normalize_url(explicit_url)
 
-        url = self._configured_url
-        if url in _HA_MANAGED_URL_ALIASES or url is None:
-            return None
-        return self._normalize_url(url)
+        return None
 
     def is_available(self, target) -> bool:
         """Return whether a shared go2rtc instance is configured for one device."""
@@ -88,6 +89,21 @@ class PetkitGo2RTCStreamManager:
         if rtsp_base is None:
             return None
         return f"{rtsp_base}/{self.stream_name(str(camera.device.id))}"
+
+    async def hls_master_url(self, target) -> str | None:
+        """Return the local go2rtc HLS master playlist URL for one device."""
+        camera = self._resolve_camera(target)
+        if camera is None:
+            return None
+
+        base_url = self.configured_url(camera)
+        if base_url is None:
+            return None
+
+        return (
+            f"{base_url.rstrip('/')}/api/stream.m3u8"
+            f"?src={self.stream_name(str(camera.device.id))}"
+        )
 
     def internal_webrtc_source(self, target) -> str | None:
         """Return the signed HA WHEP source URL consumed by the shared go2rtc."""

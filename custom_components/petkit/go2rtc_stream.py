@@ -10,16 +10,16 @@ from http import HTTPStatus
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from homeassistant.components.http.auth import async_sign_path
+from homeassistant.components.go2rtc.const import HA_MANAGED_URL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN, LOGGER
 
 _GO2RTC_DOMAIN = "go2rtc"
-_HA_MANAGED_URL = "http://127.0.0.1:11984/"
 _HA_MANAGED_URL_ALIASES = {
-    _HA_MANAGED_URL,
-    "http://localhost:11984/",
+    HA_MANAGED_URL,
+    "http://127.0.0.1:11984/",
 }
 _SIGN_EXPIRATION = timedelta(days=365)
 _GO2RTC_API_PATH = "api/streams"
@@ -43,9 +43,7 @@ class PetkitGo2RTCStreamManager:
     def _base_url(self) -> str:
         """Return the go2rtc API base URL."""
         url = self._configured_url
-        if url in _HA_MANAGED_URL_ALIASES or url is None:
-            return _HA_MANAGED_URL
-        return url
+        return HA_MANAGED_URL if url in _HA_MANAGED_URL_ALIASES or url is None else url
 
     def is_managed_available(self) -> bool:
         """Return whether HA-managed go2rtc is active."""

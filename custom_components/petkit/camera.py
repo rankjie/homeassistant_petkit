@@ -20,11 +20,13 @@ from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
 from homeassistant.components.camera import (
     CameraEntityDescription,
+    CameraCapabilities,
     CameraWebRTCProvider,
     WebRTCAnswer,
     WebRTCError,
     WebRTCSendMessage,
 )
+from homeassistant.components.camera.const import StreamType
 from homeassistant.components.web_rtc import async_register_ice_servers
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -44,7 +46,6 @@ from .const import (
 )
 from .coordinator import PetkitDataUpdateCoordinator
 from .entity import PetkitCameraBaseEntity, PetKitDescSensorBase
-from .go2rtc_stream import get_go2rtc_stream_manager
 from .rtsp_proxy import get_rtsp_proxy_manager
 
 
@@ -147,6 +148,11 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
     def available(self) -> bool:
         """Return if entity is available."""
         return super().available and self.device.id in self.coordinator.data
+
+    @property
+    def camera_capabilities(self) -> CameraCapabilities:
+        """Force the frontend onto the stream/HLS path backed by the RTSP listener."""
+        return CameraCapabilities(frontend_stream_types={StreamType.HLS})
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
@@ -303,10 +309,7 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def stream_source(self) -> str | None:
         """Return the preferred source for downstream stream consumers."""
-        go2rtc_manager = get_go2rtc_stream_manager(self.hass)
-        if go2rtc_manager.is_managed_available():
-            return await go2rtc_manager.async_ensure_stream(str(self.device.id))
-        return f"webrtc://{self.device.sn}"
+        return await get_rtsp_proxy_manager(self.hass).async_ensure_listener(self)
 
     async def async_handle_async_webrtc_offer(
         self,
@@ -315,34 +318,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         send_message: WebRTCSendMessage,
     ) -> None:
         """Handle browser WebRTC offer and return SDP answer."""
-        go2rtc_manager = get_go2rtc_stream_manager(self.hass)
-        if go2rtc_manager.is_managed_available():
-            provider = await self._async_get_go2rtc_provider()
-            if provider is None:
-                send_message(
-                    WebRTCError(
-                        code="go2rtc_provider_unavailable",
-                        message=(
-                            "HA-managed go2rtc is required for the shared PetKit stream "
-                            "but no compatible WebRTC provider is available"
-                        ),
-                    )
-                )
-                return
-
-            self._go2rtc_browser_sessions[session_id] = provider
-            try:
-                await provider.async_handle_async_webrtc_offer(
-                    self,
-                    offer_sdp,
-                    session_id,
-                    send_message,
-                )
-            except Exception:  # noqa: BLE001
-                self._go2rtc_browser_sessions.pop(session_id, None)
-                raise
-            return
-
         answer_sdp = await self._async_try_rebroadcast_browser_offer(
             offer_sdp,
             session_id,
@@ -657,9 +632,6 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
 
     async def _async_get_go2rtc_provider(self) -> CameraWebRTCProvider | None:
         """Return the HA-registered go2rtc WebRTC provider when available."""
-        if not get_go2rtc_stream_manager(self.hass).is_managed_available():
-            return None
-
         from homeassistant.components.camera.webrtc import async_get_supported_provider
 
         provider = await async_get_supported_provider(self.hass, self)

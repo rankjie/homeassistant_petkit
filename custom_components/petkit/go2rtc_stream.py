@@ -109,8 +109,9 @@ class PetkitGo2RTCStreamManager:
 
             statuses: list[str] = []
             for method, params in methods:
-                status = await self._async_call_api(method, params)
-                statuses.append(f"{method.upper()}={status}")
+                status, detail = await self._async_call_api(method, params)
+                detail_suffix = f" ({detail})" if detail else ""
+                statuses.append(f"{method.upper()}={status}{detail_suffix}")
                 if status in (
                     HTTPStatus.OK,
                     HTTPStatus.CREATED,
@@ -141,7 +142,7 @@ class PetkitGo2RTCStreamManager:
         lock = self._locks.setdefault(stream_name, asyncio.Lock())
         async with lock:
             for params in ({"dst": stream_name}, {"name": stream_name}):
-                status = await self._async_call_api("delete", params)
+                status, _ = await self._async_call_api("delete", params)
                 if status in (HTTPStatus.OK, HTTPStatus.NO_CONTENT):
                     return True
                 if status == HTTPStatus.NOT_FOUND:
@@ -182,8 +183,10 @@ class PetkitGo2RTCStreamManager:
             return None
         return payload
 
-    async def _async_call_api(self, method: str, params: dict[str, str]) -> int:
-        """Call the go2rtc API and return the HTTP status code."""
+    async def _async_call_api(
+        self, method: str, params: dict[str, str]
+    ) -> tuple[int, str | None]:
+        """Call the go2rtc API and return the HTTP status code plus error detail."""
         request: Callable[..., object] = getattr(self._session, method)
         try:
             async with request(
@@ -192,10 +195,10 @@ class PetkitGo2RTCStreamManager:
                 timeout=_REQUEST_TIMEOUT,
             ) as response:
                 await response.read()
-                return response.status
+                return response.status, None
         except (ClientError, TimeoutError) as err:
             LOGGER.debug("go2rtc %s failed for %s: %s", method.upper(), params, err)
-            return 0
+            return 0, str(err)
 
 
 def get_go2rtc_stream_manager(hass: HomeAssistant) -> PetkitGo2RTCStreamManager:

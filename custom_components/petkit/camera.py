@@ -636,9 +636,14 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
         ]
 
         LOGGER.debug(
-            "Cached %d ICE servers for PetKit camera %s",
+            "Cached %d ICE servers for PetKit camera %s "
+            "(gateway_addresses=%d turn_addresses=%d response_flags=%s "
+            "use_all_turn_servers=False)",
             len(self._ice_servers),
             self.device.id,
+            len(response.get_gateway_addresses() or []),
+            len(response.get_turn_addresses() or []),
+            sorted(response.responses or {}),
         )
 
     @staticmethod

@@ -7,7 +7,7 @@ import contextlib
 from dataclasses import dataclass
 from http import HTTPStatus
 import secrets
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -33,6 +33,70 @@ if TYPE_CHECKING:
 TOKEN_REFRESH_INTERVAL_SECONDS = 20 * 60
 _GO2RTC_WHEP_PATH = "api/webrtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=15)
+
+
+def _ice_candidate_type(candidate: RTCIceCandidateInit) -> str:
+    """Return the ICE candidate type from an SDP candidate line."""
+    candidate_string = candidate.candidate or ""
+    parts = candidate_string.split()
+    if "typ" not in parts:
+        return "unknown"
+    type_index = parts.index("typ") + 1
+    if type_index >= len(parts):
+        return "unknown"
+    return parts[type_index]
+
+
+def _candidate_type_counts(candidates: list[RTCIceCandidateInit]) -> dict[str, int]:
+    """Return a compact candidate type histogram for diagnostics."""
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        candidate_type = _ice_candidate_type(candidate)
+        counts[candidate_type] = counts.get(candidate_type, 0) + 1
+    return counts
+
+
+def _offer_sdp_summary(offer_sdp: str) -> dict[str, Any]:
+    """Return a sanitized SDP offer summary for diagnostics."""
+    try:
+        parsed = sdp_parse(offer_sdp)
+    except Exception as err:  # noqa: BLE001
+        return {"parse_error": str(err), "length": len(offer_sdp)}
+
+    media_summary: list[dict[str, Any]] = []
+    for media in parsed.get("media", []) or []:
+        media_summary.append(
+            {
+                "type": media.get("type"),
+                "mid": media.get("mid"),
+                "direction": media.get("direction", "sendrecv"),
+                "payloads": len(str(media.get("payloads", "")).split()),
+                "candidates": len(media.get("candidates", []) or []),
+                "extensions": len(media.get("ext", []) or []),
+            }
+        )
+
+    return {
+        "length": len(offer_sdp),
+        "media": media_summary,
+        "session_candidates": len(parsed.get("candidates", []) or []),
+        "groups": len(parsed.get("groups", []) or []),
+        "extmap_allow_mixed": bool(parsed.get("extmapAllowMixed", False)),
+    }
+
+
+def _agora_response_summary(agora_response: Any) -> dict[str, Any]:
+    """Return an Agora choose-server summary without credentials."""
+    return {
+        "flag": agora_response.flag,
+        "response_flags": sorted(agora_response.responses or {}),
+        "primary_addresses": len(agora_response.addresses or []),
+        "gateway_addresses": len(agora_response.get_gateway_addresses() or []),
+        "turn_addresses": len(agora_response.get_turn_addresses() or []),
+        "selected_ice_servers": len(
+            agora_response.get_ice_servers(use_all_turn_servers=False)
+        ),
+    }
 
 
 def _check_external_auth(request: web.Request) -> web.Response | None:
@@ -126,15 +190,36 @@ class PetkitAgoraUpstreamManager:
     ) -> tuple[str, str]:
         """Create or replace one direct Agora session for the device."""
         device_id = str(camera.device.id)
+        LOGGER.info(
+            "go2rtc upstream diagnostics: creating session device=%s "
+            "device_type=%s offer=%s",
+            device_id,
+            type(camera.device).__name__,
+            _offer_sdp_summary(offer_sdp),
+        )
         await self.close_session(device_id)
 
         live_feed = await camera.async_get_live_feed(refresh=True)
         if live_feed is None:
             raise RuntimeError("Live feed unavailable or missing RTM credentials")
+        LOGGER.debug(
+            "go2rtc upstream live feed summary: device=%s uid=%s "
+            "channel_present=%s rtc_token_len=%d rtm_token_len=%d",
+            device_id,
+            getattr(live_feed, "uid", None),
+            bool(getattr(live_feed, "channel_id", None)),
+            len(getattr(live_feed, "rtc_token", "") or ""),
+            len(getattr(live_feed, "rtm_token", "") or ""),
+        )
 
         agora_response = await camera.async_refresh_agora_context(live_feed)
         if agora_response is None:
             raise RuntimeError("Failed to retrieve Agora edge servers")
+        LOGGER.info(
+            "go2rtc upstream Agora server summary: device=%s %s",
+            device_id,
+            _agora_response_summary(agora_response),
+        )
 
         agora_rtm = AgoraRTMSignaling(AGORA_APP_ID)
 
@@ -160,19 +245,44 @@ class PetkitAgoraUpstreamManager:
             disable_audio_answer=True,
             on_connection_lost=_on_connection_lost,
         )
+        initial_candidates: list[RTCIceCandidateInit] = []
         for line in offer_sdp.splitlines():
             stripped = line.strip()
             if stripped.startswith("a=candidate:"):
-                agora_handler.add_ice_candidate(
+                initial_candidates.append(
                     RTCIceCandidateInit(candidate=stripped.removeprefix("a="))
                 )
 
+        for candidate in initial_candidates:
+            agora_handler.add_ice_candidate(candidate)
+        LOGGER.info(
+            "go2rtc upstream initial ICE candidates: device=%s count=%d types=%s",
+            device_id,
+            len(initial_candidates),
+            _candidate_type_counts(initial_candidates),
+        )
+
+        unfiltered_candidates = list(agora_handler.candidates)
         agora_handler.candidates = camera.filter_agora_candidates(
             agora_handler.candidates,
             agora_response,
         )
+        LOGGER.info(
+            "go2rtc upstream filtered ICE candidates: device=%s before=%d "
+            "after=%d before_types=%s after_types=%s",
+            device_id,
+            len(unfiltered_candidates),
+            len(agora_handler.candidates),
+            _candidate_type_counts(unfiltered_candidates),
+            _candidate_type_counts(agora_handler.candidates),
+        )
 
         rtm_started = await agora_rtm.start_live(live_feed)
+        LOGGER.info(
+            "go2rtc upstream start_live result: device=%s started=%s",
+            device_id,
+            rtm_started,
+        )
         if not rtm_started:
             LOGGER.warning(
                 "go2rtc upstream start_live/heartbeat not active for %s",
@@ -189,6 +299,13 @@ class PetkitAgoraUpstreamManager:
                 agora_response=agora_response,
             )
         except Exception:
+            LOGGER.exception(
+                "go2rtc upstream connect/join raised: device=%s session=%s "
+                "handler_state=%s",
+                device_id,
+                session_id,
+                agora_handler.diagnostic_state(),
+            )
             await asyncio.gather(
                 agora_handler.disconnect(),
                 agora_rtm.stop_live(send_stop=True),
@@ -205,6 +322,14 @@ class PetkitAgoraUpstreamManager:
             raise RuntimeError(
                 "Agora upstream negotiation did not return an SDP answer"
             )
+        LOGGER.info(
+            "go2rtc upstream negotiated: device=%s session=%s answer_len=%d "
+            "handler_state=%s",
+            device_id,
+            session_id,
+            len(answer_sdp),
+            agora_handler.diagnostic_state(),
+        )
 
         session = AgoraUpstreamSession(
             session_id=session_id,
@@ -266,16 +391,31 @@ class PetkitAgoraUpstreamManager:
         if session is None or session.session_id != session_id:
             return False
 
+        parsed_candidates = _parse_trickle_candidates(sdp_fragment)
         added = 0
-        for candidate in _parse_trickle_candidates(sdp_fragment):
+        for candidate in parsed_candidates:
             session.agora_handler.add_ice_candidate(candidate)
             added += 1
 
         if added:
-            LOGGER.debug(
-                "Collected %d upstream PATCH candidates for %s",
-                added,
+            LOGGER.info(
+                "go2rtc upstream PATCH ICE candidates: device=%s session=%s "
+                "fragment_len=%d added=%d types=%s handler_state=%s",
                 device_id,
+                session_id,
+                len(sdp_fragment),
+                added,
+                _candidate_type_counts(parsed_candidates),
+                session.agora_handler.diagnostic_state(),
+            )
+        else:
+            LOGGER.debug(
+                "go2rtc upstream PATCH did not contain ICE candidates: "
+                "device=%s session=%s fragment_len=%d handler_state=%s",
+                device_id,
+                session_id,
+                len(sdp_fragment),
+                session.agora_handler.diagnostic_state(),
             )
         return True
 

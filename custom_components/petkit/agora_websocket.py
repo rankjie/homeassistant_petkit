@@ -36,6 +36,109 @@ def _create_ws_ssl_context() -> ssl.SSLContext:
 _SSL_CONTEXT = _create_ws_ssl_context()
 
 
+def _ice_candidate_type(candidate: RTCIceCandidateInit) -> str:
+    """Return the ICE candidate type from an SDP candidate line."""
+    candidate_string = candidate.candidate or ""
+    parts = candidate_string.split()
+    if "typ" not in parts:
+        return "unknown"
+    type_index = parts.index("typ") + 1
+    if type_index >= len(parts):
+        return "unknown"
+    return parts[type_index]
+
+
+def _candidate_type_counts(candidates: list[RTCIceCandidateInit]) -> dict[str, int]:
+    """Return a compact candidate type histogram for diagnostics."""
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        candidate_type = _ice_candidate_type(candidate)
+        counts[candidate_type] = counts.get(candidate_type, 0) + 1
+    return counts
+
+
+def _ortc_candidate_type_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    """Return a compact ORTC candidate type histogram for diagnostics."""
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        candidate_type = str(candidate.get("type") or "unknown")
+        counts[candidate_type] = counts.get(candidate_type, 0) + 1
+    return counts
+
+
+def _offer_media_summary(offer_info: OfferSdpInfo) -> list[dict[str, Any]]:
+    """Return SDP media details that are useful without logging full SDP."""
+    summary: list[dict[str, Any]] = []
+    for media in offer_info.parsed_sdp.get("media", []) or []:
+        payloads = str(media.get("payloads", "")).split()
+        summary.append(
+            {
+                "type": media.get("type"),
+                "mid": media.get("mid"),
+                "direction": media.get("direction", "sendrecv"),
+                "payloads": len(payloads),
+                "candidates": len(media.get("candidates", []) or []),
+                "extensions": len(media.get("ext", []) or []),
+            }
+        )
+    return summary
+
+
+def _rtp_capability_summary(ortc_info: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact ORTC capability summary for diagnostics."""
+    rtp_capabilities = ortc_info.get("rtpCapabilities", {}) or {}
+    direction_summary: dict[str, dict[str, int]] = {}
+    for direction in ("send", "recv", "sendrecv"):
+        caps = rtp_capabilities.get(direction)
+        if not isinstance(caps, dict):
+            continue
+
+        audio_codecs = caps.get("audioCodecs", []) or []
+        video_codecs = caps.get("videoCodecs", []) or []
+        direction_summary[direction] = {
+            "audio_codecs": len(audio_codecs),
+            "video_codecs": len(video_codecs),
+            "audio_extensions": len(caps.get("audioExtensions", []) or []),
+            "video_extensions": len(caps.get("videoExtensions", []) or []),
+            "rtcp_feedbacks": sum(
+                len(codec.get("rtcpFeedbacks", []) or [])
+                for codec in [*audio_codecs, *video_codecs]
+            ),
+        }
+
+    ice_candidates = ortc_info.get("iceParameters", {}).get("candidates", []) or []
+    return {
+        "directions": direction_summary,
+        "ice_candidates": len(ice_candidates),
+        "ice_candidate_types": _ortc_candidate_type_counts(ice_candidates),
+    }
+
+
+def _websocket_message_summary(response: dict[str, Any]) -> dict[str, Any]:
+    """Return a sanitized Agora WebSocket message summary."""
+    message = response.get("_message", {})
+    message_keys: list[str] = []
+    ortc_keys: list[str] = []
+    has_ortc = False
+    if isinstance(message, dict):
+        message_keys = sorted(str(key) for key in message)
+        ortc = message.get("ortc")
+        has_ortc = bool(ortc)
+        if isinstance(ortc, dict):
+            ortc_keys = sorted(str(key) for key in ortc)
+
+    return {
+        "type": response.get("_type"),
+        "result": response.get("_result"),
+        "id": response.get("_id"),
+        "error_code": response.get("error_code"),
+        "error_str": response.get("error_str"),
+        "message_keys": message_keys,
+        "has_ortc": has_ortc,
+        "ortc_keys": ortc_keys,
+    }
+
+
 @dataclass
 class OfferSdpInfo:
     """Selected pieces of the browser offer SDP used for answer generation."""
@@ -111,6 +214,25 @@ class AgoraWebSocketHandler:
         """Collect browser ICE candidates before join_v3."""
         self.candidates.append(candidate)
 
+    def diagnostic_state(self) -> dict[str, Any]:
+        """Return sanitized runtime state for fan-out diagnostics."""
+        return {
+            "connection_state": self._connection_state,
+            "joined": self._joined,
+            "pending_answer": self._pending_answer_ortc is not None,
+            "candidate_count": len(self.candidates),
+            "candidate_types": _candidate_type_counts(self.candidates),
+            "online_users": len(self._online_users),
+            "video_streams": {
+                str(uid): {
+                    "ssrcId": stream.get("ssrcId"),
+                    "rtxSsrcId": stream.get("rtxSsrcId"),
+                }
+                for uid, stream in self._video_streams.items()
+            },
+            "subscribed_streams": len(self._subscribed_video_streams),
+        }
+
     async def connect_and_join(
         self,
         live_feed: LiveFeed,
@@ -132,16 +254,28 @@ class AgoraWebSocketHandler:
             LOGGER.error("Failed to build ORTC capabilities from offer")
             return None
 
+        LOGGER.info(
+            "Agora join_v3 diagnostics: session=%s offer_media=%s "
+            "initial_candidate_count=%d initial_candidate_types=%s",
+            session_id,
+            _offer_media_summary(offer_info),
+            len(self.candidates),
+            _candidate_type_counts(self.candidates),
+        )
+
         # Add gathered candidates to ORTC offer before join_v3.
         gathered_candidates = self._convert_candidates_to_ortc()
         if gathered_candidates:
-            ortc_info.setdefault("iceParameters", {})[
-                "candidates"
-            ] = gathered_candidates
+            ortc_info.setdefault("iceParameters", {})["candidates"] = (
+                gathered_candidates
+            )
         LOGGER.debug(
-            "Agora join_v3: session=%s gathered_candidates=%d",
+            "Agora join_v3: session=%s gathered_candidates=%d "
+            "gathered_candidate_types=%s ortc_summary=%s",
             session_id,
             len(gathered_candidates),
+            _ortc_candidate_type_counts(gathered_candidates),
+            _rtp_capability_summary(ortc_info),
         )
 
         gateway_addresses = agora_response.get_gateway_addresses()
@@ -152,8 +286,11 @@ class AgoraWebSocketHandler:
             gateway_addresses = agora_response.addresses
 
         LOGGER.debug(
-            "Agora join_v3: trying %d gateway addresses",
+            "Agora join_v3: trying %d gateway addresses, turn_addresses=%d, "
+            "response_flags=%s",
             len(gateway_addresses),
+            len(agora_response.get_turn_addresses() or []),
+            sorted(agora_response.responses or {}),
         )
         for gateway in gateway_addresses:
             edge_ip_dashed = gateway.ip.replace(".", "-")
@@ -178,6 +315,20 @@ class AgoraWebSocketHandler:
                     app_id=app_id,
                     ortc_info=ortc_info,
                     agora_response=agora_response,
+                )
+                user_attributes = (
+                    join_message["_message"]
+                    .get("attributes", {})
+                    .get("userAttributes", {})
+                )
+                LOGGER.debug(
+                    "Agora join_v3 payload summary: session=%s channel_present=%s "
+                    "token_present=%s role=%s instant_video=%s",
+                    session_id,
+                    bool(live_feed.channel_id),
+                    bool(live_feed.rtc_token),
+                    join_message["_message"].get("role"),
+                    user_attributes.get("enableInstantVideo"),
                 )
                 await websocket.send(json.dumps(join_message))
                 LOGGER.debug("Sent join_v3 message")
@@ -231,6 +382,10 @@ class AgoraWebSocketHandler:
                         LOGGER.debug("Dropped non-JSON websocket payload")
                         continue
 
+                    LOGGER.debug(
+                        "Agora join_v3 pre-answer WS response: %s",
+                        _websocket_message_summary(response),
+                    )
                     message_type = response.get("_type", "")
                     if message_type in self._message_handlers:
                         result = await self._message_handlers[message_type](response)
@@ -348,8 +503,17 @@ class AgoraWebSocketHandler:
         message = response.get("_message", {})
         ortc = message.get("ortc", {})
         if not ortc:
-            LOGGER.error("join_v3 success did not include ORTC parameters")
+            LOGGER.error(
+                "join_v3 success did not include ORTC parameters: %s",
+                _websocket_message_summary(response),
+            )
             return None
+        LOGGER.info(
+            "join_v3 success included ORTC parameters: %s",
+            _rtp_capability_summary(
+                {"rtpCapabilities": ortc.get("rtpCapabilities", {})}
+            ),
+        )
 
         await self._send_set_client_role(role="host", level=0)
         await self._register_existing_video_streams(message)
@@ -414,9 +578,10 @@ class AgoraWebSocketHandler:
     async def _handle_p2p_lost(self, response: dict[str, Any]) -> None:
         """Handle p2p_lost signaling."""
         LOGGER.warning(
-            "Agora p2p_lost: code=%s error=%s",
+            "Agora p2p_lost: code=%s error=%s state=%s",
             response.get("error_code"),
             response.get("error_str"),
+            self.diagnostic_state(),
         )
         self._disconnect_task = asyncio.create_task(self.disconnect())
         self._fire_connection_lost()
@@ -450,10 +615,11 @@ class AgoraWebSocketHandler:
             return None
 
         LOGGER.debug(
-            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s",
+            "Agora on_add_video_stream: uid=%s ssrc=%s rtx_ssrc=%s cname_present=%s",
             uid,
             ssrc_id,
             rtx_ssrc_id,
+            bool(cname),
         )
         self._video_streams[uid] = {
             "ssrcId": ssrc_id,
@@ -485,6 +651,11 @@ class AgoraWebSocketHandler:
             self._answer_sdp = answer_sdp
             self._pending_answer_ortc = None
             self._pending_offer_info = None
+            LOGGER.info(
+                "Agora join_v3 finalized answer: sdp_length=%d state=%s",
+                len(answer_sdp),
+                self.diagnostic_state(),
+            )
             return answer_sdp
         return None
 
@@ -715,16 +886,21 @@ class AgoraWebSocketHandler:
     def _convert_candidates_to_ortc(self) -> list[dict[str, Any]]:
         """Convert browser ICE candidates to Agora ORTC format."""
         converted: list[dict[str, Any]] = []
+        skipped_empty = 0
+        skipped_malformed = 0
+        skipped_invalid = 0
 
         for candidate in self.candidates:
             candidate_string = candidate.candidate
             if not candidate_string:
+                skipped_empty += 1
                 continue
 
             candidate_string = candidate_string.removeprefix("candidate:")
 
             parts = candidate_string.split()
             if len(parts) < 8:
+                skipped_malformed += 1
                 continue
 
             try:
@@ -739,8 +915,22 @@ class AgoraWebSocketHandler:
                     }
                 )
             except (TypeError, ValueError):
+                skipped_invalid += 1
                 continue
 
+        if self.candidates:
+            LOGGER.debug(
+                "Agora ICE candidate conversion: input=%d converted=%d "
+                "input_types=%s converted_types=%s skipped_empty=%d "
+                "skipped_malformed=%d skipped_invalid=%d",
+                len(self.candidates),
+                len(converted),
+                _candidate_type_counts(self.candidates),
+                _ortc_candidate_type_counts(converted),
+                skipped_empty,
+                skipped_malformed,
+                skipped_invalid,
+            )
         return converted
 
     @staticmethod
@@ -986,8 +1176,7 @@ class AgoraWebSocketHandler:
                 feedback_parameter = feedback.get("parameter")
                 if feedback_parameter:
                     codec_lines.append(
-                        "a=rtcp-fb:"
-                        f"{payload_type} {feedback_type} {feedback_parameter}"
+                        f"a=rtcp-fb:{payload_type} {feedback_type} {feedback_parameter}"
                     )
                 else:
                     codec_lines.append(f"a=rtcp-fb:{payload_type} {feedback_type}")
@@ -1111,6 +1300,20 @@ class AgoraWebSocketHandler:
                 ice_parameters.get("candidates", []) or []
             )
             primary_video_stream = self._primary_video_stream()
+            LOGGER.debug(
+                "Agora answer SDP inputs: media_sections=%d candidate_lines=%d "
+                "remote_candidate_types=%s caps_summary=%s primary_video=%s",
+                len(media_sections),
+                len(candidate_lines),
+                _ortc_candidate_type_counts(ice_parameters.get("candidates", []) or []),
+                _rtp_capability_summary(ortc),
+                {
+                    "ssrcId": primary_video_stream.get("ssrcId"),
+                    "rtxSsrcId": primary_video_stream.get("rtxSsrcId"),
+                }
+                if primary_video_stream
+                else None,
+            )
 
             for index, media in enumerate(media_sections):
                 sdp_lines.extend(

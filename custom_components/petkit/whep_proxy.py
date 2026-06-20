@@ -220,6 +220,11 @@ class PetkitAgoraUpstreamManager:
             device_id,
             _agora_response_summary(agora_response),
         )
+        LOGGER.warning(
+            "go2rtc upstream Agora PLAINTEXT TURN diagnostics: device=%s %s",
+            device_id,
+            agora_response.plaintext_ice_diagnostics(),
+        )
 
         agora_rtm = AgoraRTMSignaling(AGORA_APP_ID)
 

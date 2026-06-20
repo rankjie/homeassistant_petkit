@@ -645,6 +645,11 @@ class PetkitWebRTCCamera(PetkitCameraBaseEntity):
             len(response.get_turn_addresses() or []),
             sorted(response.responses or {}),
         )
+        LOGGER.warning(
+            "Agora PLAINTEXT TURN diagnostics for PetKit camera %s: %s",
+            self.device.id,
+            response.plaintext_ice_diagnostics(),
+        )
 
     @staticmethod
     def _filter_candidates(

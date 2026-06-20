@@ -244,6 +244,48 @@ class AgoraResponse:
 
         return servers
 
+    def plaintext_ice_diagnostics(self) -> dict[str, Any]:
+        """Return full Agora ICE details for private diagnostic builds."""
+        return {
+            "gateway_addresses": [
+                self._plaintext_edge_address(address)
+                for address in self.get_gateway_addresses()
+            ],
+            "turn_addresses": [
+                self._plaintext_edge_address(address)
+                for address in self.get_turn_addresses()
+            ],
+            "selected_ice_servers": [
+                self._plaintext_ice_server(server)
+                for server in self.get_ice_servers(use_all_turn_servers=False)
+            ],
+            "all_ice_servers": [
+                self._plaintext_ice_server(server)
+                for server in self.get_ice_servers(use_all_turn_servers=True)
+            ],
+        }
+
+    @staticmethod
+    def _plaintext_edge_address(address: EdgeAddress) -> dict[str, Any]:
+        """Return one Agora edge entry with TURN credentials unredacted."""
+        return {
+            "ip": address.ip,
+            "port": address.port,
+            "username": address.username,
+            "credential": address.credentials,
+            "ticket": address.ticket,
+            "fingerprint": address.fingerprint,
+        }
+
+    @staticmethod
+    def _plaintext_ice_server(server: ICEServer) -> dict[str, Any]:
+        """Return one ICE server entry with credentials unredacted."""
+        return {
+            "urls": server.urls,
+            "username": server.username,
+            "credential": server.credential,
+        }
+
     def to_ap_response(self, flag: int | None = None) -> dict[str, Any]:
         """Convert response to join_v3 ap_response payload format."""
         if flag is not None and self.responses:
@@ -442,10 +484,7 @@ class AgoraAPIClient:
         proxy_server: str | None = None,
     ) -> dict[str, Any]:
         if proxy_server:
-            url = (
-                f"https://{proxy_server}/ap/?url="
-                f"{domain}/api/v2/transpond/webrtc?v=2"
-            )
+            url = f"https://{proxy_server}/ap/?url={domain}/api/v2/transpond/webrtc?v=2"
         else:
             url = f"https://{domain}/api/v2/transpond/webrtc?v=2"
 
